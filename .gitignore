@@ -19,3 +19,6 @@ workspace/*
 # Cloudflare
 .wrangler/
 node_modules/
+
+# Password for the hosted chat page (never commit)
+hosted-page-password.txt

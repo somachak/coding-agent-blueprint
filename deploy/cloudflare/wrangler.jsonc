@@ -19,7 +19,7 @@
       // MUST match the @cloudflare/sandbox version in package.json.
       "image": "docker.io/cloudflare/sandbox:0.12.9-python",
       "instance_type": "lite",
-      "max_instances": 3
+      "max_instances": 10
     }
   ],
   "durable_objects": {
