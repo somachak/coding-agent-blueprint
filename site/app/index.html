@@ -20,8 +20,10 @@
   header .meta b { color: var(--ink); font-weight: 600; }
   header .spacer { flex: 1; }
   header button { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; font-size: 13px; cursor: pointer; color: var(--ink); }
-  header button:hover { border-color: var(--accent); color: var(--accent); }
+  header button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  header button:disabled { opacity: .45; cursor: default; }
   #warn { display: none; background: #fff3cd; color: #6b4d00; padding: 8px 18px; font-size: 13px; border-bottom: 1px solid #e8d48a; }
+  #warn code { background: #fff; }
   main { flex: 1; display: grid; grid-template-columns: minmax(320px, 1fr) minmax(360px, 1.2fr); gap: 0; min-height: 0; }
   section { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); }
   section:last-child { border-right: none; }
@@ -36,12 +38,14 @@
   .bubble.user { background: var(--user); margin-left: auto; border-bottom-right-radius: 4px; }
   .bubble.agent { background: var(--panel); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
   .bubble.error { background: #fdecea; border: 1px solid #f4c3bf; color: var(--bad); }
+  .bubble.notice { background: #fff8e6; border: 1px solid #ecd9a8; color: #6b4d00; }
   .bubble .label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; font-weight: 600; letter-spacing: .3px; text-transform: uppercase; }
   form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); background: var(--panel); }
   textarea { flex: 1; resize: none; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font: inherit; font-size: 14px; min-height: 44px; max-height: 160px; }
   textarea:focus { outline: 2px solid #b9cff5; border-color: var(--accent); }
   form button { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 0 18px; font-size: 14px; cursor: pointer; }
   form button:disabled { opacity: .5; cursor: wait; }
+  form button#stop { background: var(--panel); color: var(--bad); border: 1px solid #f4c3bf; }
 
   /* Assistant panel: the loop, step by step */
   .step { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); margin-bottom: 10px; overflow: hidden; }
@@ -70,14 +74,17 @@
   .msg pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12px; color: var(--code-ink); max-height: 200px; overflow: auto; }
   .hint { color: var(--muted); font-size: 13px; line-height: 1.5; }
   .hint code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-family: var(--mono); }
+
+  /* Settings panel */
   .settings { background: var(--panel); border-bottom: 1px solid var(--line); padding: 12px 18px; }
   .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px 16px; }
   .settings label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 600; color: var(--muted); }
   .settings input { font: inherit; font-size: 13px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); }
   .settings small { font-weight: 400; color: var(--muted); }
-  .settings-actions { margin-top: 10px; display: flex; gap: 8px; }
+  .settings-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .settings-actions button { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
   #s-save { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #s-error { color: var(--bad); font-size: 13px; }
   @media (max-width: 860px) { main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } section { border-right: none; border-bottom: 1px solid var(--line); } }
 </style>
 </head>
@@ -102,19 +109,23 @@
       <small>Where the Python agent is running. Empty means the same site as this page.</small>
     </label>
     <label>API key
-      <input id="s-key" type="password" placeholder="sk-or-...  (OpenRouter, or any OpenAI-compatible key)">
-      <small>Kept in this browser only and sent to the agent server with each message. Leave empty to use the server's .env.</small>
+      <input id="s-key" type="password" autocomplete="off" placeholder="sk-or-...  (OpenRouter, or the provider below)">
+      <small>Held in this page's memory only: it is gone when you close the tab, and it is never saved to disk.</small>
     </label>
-    <label>Base URL
+    <label>Provider base URL
       <input id="s-base" placeholder="https://openrouter.ai/api/v1">
+      <small>Change this together with its key. Only OpenRouter or the server's own provider unless the server allows more.</small>
     </label>
     <label>Model
       <input id="s-model" placeholder="openai/gpt-5-mini">
+      <small>Takes effect on the next message; the header shows it once the model has answered.</small>
     </label>
   </div>
   <div class="settings-actions">
-    <button id="s-save">Save and reconnect</button>
+    <button id="s-save">Save</button>
+    <button id="s-defaults">Use server defaults</button>
     <button id="s-close">Close</button>
+    <span id="s-error"></span>
   </div>
 </div>
 <main>
@@ -129,6 +140,7 @@
     <form id="form">
       <textarea id="input" placeholder="What should the agent do? (Enter to send, Shift+Enter for a new line)" rows="2"></textarea>
       <button id="send" type="submit">Send</button>
+      <button id="stop" type="button" hidden>Stop</button>
     </form>
   </section>
   <section>
@@ -151,28 +163,40 @@
   const form = document.getElementById('form');
   const input = document.getElementById('input');
   const sendButton = document.getElementById('send');
+  const stopButton = document.getElementById('stop');
+  const resetButton = document.getElementById('reset');
   const warn = document.getElementById('warn');
 
-  // ----- settings: where the agent server is, and which model/key to use ---------
-  // Saved in this browser only (localStorage). The key is sent to the agent
-  // server with each message and lives only in that server's memory.
-  const SETTINGS_KEY = 'coding-agent-blueprint-settings';
-  function loadSettings() {
-    try { return JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'); } catch (e) { return {}; }
+  // How long the page waits without hearing anything before it gives up.
+  // Longer than the server's own model timeout, so the server speaks first.
+  const INACTIVITY_MS = 150000;
+
+  // ----- settings ------------------------------------------------------------------
+  // Three harmless values are remembered in this browser (localStorage):
+  // the server URL, the provider URL and the model name. The API KEY is
+  // not: it lives in the variable below and disappears with the tab.
+  const STORAGE_KEY = 'coding-agent-blueprint-settings';
+  let saved = loadSaved();
+  let sessionKey = '';
+  let activeState = null;          // the last /state answer: what the server is really using
+
+  function loadSaved() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+      return { backend: raw.backend || '', base_url: raw.base_url || '', model: raw.model || '' };
+    } catch (e) { return { backend: '', base_url: '', model: '' }; }
   }
-  function saveSettings(values) {
-    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(values)); } catch (e) { /* private mode: ignore */ }
+  function storeSaved() {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(saved)); } catch (e) { /* private mode: ignore */ }
   }
-  let userSettings = loadSettings();
   function backendUrl(path) {
-    const base = (userSettings.backend || '').replace(/\/$/, '');
-    return base + path;
+    return saved.backend.replace(/\/$/, '') + path;
   }
-  function modelOverrides() {
-    return { api_key: userSettings.api_key || '', base_url: userSettings.base_url || '', model: userSettings.model || '' };
+  function overridesForThisMessage() {
+    return { api_key: sessionKey, base_url: saved.base_url, model: saved.model };
   }
 
-  // ----- small helpers -------------------------------------------------------
+  // ----- small helpers -------------------------------------------------------------
   function el(tag, className, text) {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -183,52 +207,66 @@
   function prettyArgs(json) {
     try { return JSON.stringify(JSON.parse(json), null, 2); } catch (e) { return json; }
   }
+  // The warning bar is built from text nodes and <code> elements only, so
+  // a value typed into Settings can never become markup.
+  function showWarning(parts) {
+    warn.replaceChildren();
+    for (const part of parts) {
+      if (typeof part === 'string') warn.appendChild(document.createTextNode(part));
+      else warn.appendChild(el('code', null, part.code));
+    }
+    warn.style.display = 'block';
+  }
+  function hideWarning() { warn.style.display = 'none'; }
 
-  // ----- header state ------------------------------------------------------------
+  // ----- header state -----------------------------------------------------------------
   async function refreshState() {
-    let state;
     try {
       const response = await fetch(backendUrl('/state'));
       if (!response.ok) throw new Error('HTTP ' + response.status);
-      state = await response.json();
+      activeState = await response.json();
     } catch (error) {
-      warn.style.display = 'block';
-      warn.innerHTML = 'No agent server answered at <b>' + (userSettings.backend || 'this site') + '</b>. ' +
-        'Start one on your computer with <code>python3 -m agent.server</code>, then open Settings and set the ' +
-        'Agent server URL to <code>http://127.0.0.1:8765</code>. (Safari blocks that from a hosted page; use Chrome or Firefox, or open the local URL directly.)';
+      activeState = null;
+      showWarning([
+        'No agent server answered at ', { code: saved.backend || 'this site' },
+        '. Start one on your computer with ', { code: 'python3 -m agent.server' },
+        ', then open Settings and set the Agent server URL to ', { code: 'http://127.0.0.1:8765' },
+        '. (Safari blocks that from a hosted page; use Chrome or Firefox, or open the local URL directly.)',
+      ]);
       return;
     }
-    document.getElementById('m-model').textContent = userSettings.model || state.model || '(not set)';
+    const state = activeState;
+    let modelLabel = state.model || '(not set)';
+    if (saved.model && saved.model !== state.model) modelLabel += ' (next message: ' + saved.model + ')';
+    document.getElementById('m-model').textContent = modelLabel;
     document.getElementById('m-tools').textContent = state.tools.join(', ');
-    document.getElementById('m-tokens').textContent = `${state.usage.prompt_tokens} in / ${state.usage.completion_tokens} out`;
+    document.getElementById('m-tokens').textContent = state.usage.prompt_tokens + ' in / ' + state.usage.completion_tokens + ' out';
     document.getElementById('m-count').textContent = state.messages.length;
     renderMessages(state.messages);
-    const keyMissing = state.missing.includes('LLM_API_KEY') && !userSettings.api_key;
+    const keyMissing = state.missing.includes('LLM_API_KEY') && !sessionKey;
     if (keyMissing) {
-      warn.style.display = 'block';
-      warn.innerHTML = 'No API key yet. Either paste it into <code>.env</code> (LLM_API_KEY) and restart the server, or open <b>Settings</b> and paste it there.';
+      showWarning(['No API key yet. Either paste it into ', { code: '.env' }, ' (LLM_API_KEY) and restart the server, or open Settings and paste it there for this tab.']);
     } else {
-      warn.style.display = 'none';
+      hideWarning();
     }
   }
 
   function renderMessages(messages) {
-    messagesPane.innerHTML = '';
-    const intro = el('p', 'hint', 'This is the exact list sent to the model on every call. It only ever grows. The system message sets the rules, then user / assistant / tool messages alternate. Every tool message answers one tool call by id.');
-    messagesPane.appendChild(intro);
+    messagesPane.replaceChildren();
+    messagesPane.appendChild(el('p', 'hint', 'This is the exact list sent to the model on every call. It only ever grows, except that a failed turn is removed again. The system message sets the rules, then user / assistant / tool messages alternate. Every tool message answers one tool call by id.'));
     messages.forEach((m, index) => {
       const box = el('div', 'msg ' + m.role);
-      box.appendChild(el('div', 'role', `${index}. ${m.role}` + (m.tool_call_id ? `  (answers ${m.tool_call_id})` : '')));
+      box.appendChild(el('div', 'role', index + '. ' + m.role + (m.tool_call_id ? '  (answers ' + m.tool_call_id + ')' : '')));
       let body = m.content || '';
       if (m.tool_calls) {
-        body += (body ? '\n' : '') + m.tool_calls.map(c => `→ ${c.function.name}(${c.function.arguments})   [${c.id}]`).join('\n');
+        body += (body ? '\n' : '') + m.tool_calls.map(c => '→ ' + c.function.name + '(' + c.function.arguments + ')   [' + c.id + ']').join('\n');
       }
       box.appendChild(el('pre', null, body));
       messagesPane.appendChild(box);
     });
   }
 
-  // ----- the assistant panel: one card per event ---------------------------------
+  // ----- the assistant panel: one card per event -------------------------------------
   let currentStep = null;
   function stepBox(step) {
     if (currentStep && currentStep.dataset.step === String(step)) return currentStep;
@@ -245,8 +283,7 @@
   function card(step, tag, tagClass, title, body, collapsed) {
     const box = stepBox(step);
     const c = el('div', 'card');
-    const t = el('span', 'tag ' + tagClass, tag);
-    c.appendChild(t);
+    c.appendChild(el('span', 'tag ' + tagClass, tag));
     c.appendChild(el('span', 'title', title));
     if (body) {
       if (collapsed) {
@@ -263,66 +300,105 @@
     return c;
   }
 
+  // The pulse is the "still waiting" dot. clearPulse() is called on EVERY
+  // way a turn can end, so the page can never look busy forever.
   let waitingCard = null;
+  function clearPulse() {
+    for (const dot of document.querySelectorAll('.pulse')) dot.remove();
+    waitingCard = null;
+  }
+
   function handleEvent(event) {
     switch (event.type) {
       case 'user':
         break;
+      case 'compaction':
+        card(0, 'reason', 'reason', 'Older messages were shrunk: ~' + event.before_tokens + ' → ~' + event.after_tokens + ' tokens');
+        break;
       case 'model_call':
-        waitingCard = card(event.step, 'reason', 'reason', `Asking the model… it sees ${event.message_count} messages`);
+        clearPulse();
+        waitingCard = card(event.step, 'reason', 'reason', 'Asking the model… it sees ' + event.message_count + ' messages');
         waitingCard.appendChild(el('span', 'pulse'));
         break;
       case 'model_reply': {
-        if (waitingCard) { waitingCard.querySelector('.pulse')?.remove(); waitingCard = null; }
-        const what = event.tool_call_count ? `decided to call ${event.tool_call_count} tool(s)` : 'decided to answer';
-        const usage = event.usage && event.usage.prompt_tokens ? `  (${event.usage.prompt_tokens} in / ${event.usage.completion_tokens} out)` : '';
-        card(event.step, 'reason', 'reason', `Model replied: ${what}${usage}`, event.tool_call_count && event.text ? event.text : '');
+        clearPulse();
+        const what = event.tool_call_count ? 'decided to call ' + event.tool_call_count + ' tool(s)' : 'decided to answer';
+        const usage = event.usage && event.usage.prompt_tokens ? '  (' + event.usage.prompt_tokens + ' in / ' + event.usage.completion_tokens + ' out)' : '';
+        card(event.step, 'reason', 'reason', 'Model replied: ' + what + usage, event.tool_call_count && event.text ? event.text : '');
         break;
       }
       case 'tool_call':
-        card(event.step, 'act', 'act', `${event.name}`, prettyArgs(event.arguments));
+        card(event.step, 'act', 'act', event.name, prettyArgs(event.arguments));
         break;
       case 'tool_result':
-        card(event.step, 'observe', 'observe', `${event.name} returned ${event.result.length} characters`, event.result, event.result.length > 600);
+        card(event.step, 'observe', 'observe', event.name + ' returned ' + event.result.length + ' characters', event.result, event.result.length > 600);
         break;
       case 'answer':
+        clearPulse();
         card(event.step, 'answer', 'answer', 'Final answer, loop stops');
         addBubble('agent', event.text || '(empty answer)');
         break;
       case 'error':
+        clearPulse();
         card(event.step || 0, 'error', 'error', event.text);
         addBubble('error', event.text);
         break;
       case 'done':
+        clearPulse();
         break;
     }
   }
 
   function addBubble(kind, text) {
     const b = el('div', 'bubble ' + kind);
-    b.appendChild(el('span', 'label', kind === 'user' ? 'you' : kind === 'agent' ? 'agent' : 'error'));
+    const label = { user: 'you', agent: 'agent', error: 'error', notice: 'note' }[kind] || kind;
+    b.appendChild(el('span', 'label', label));
     b.appendChild(document.createTextNode(text));
     chat.appendChild(b);
     scrollDown(chat);
   }
 
-  // ----- sending a message and reading the event stream ----------------------------
+  // ----- one message: send it, read the stream, and ALWAYS restore the controls --------
+  let controller = null;
+  function setBusy(busy) {
+    sendButton.disabled = busy;
+    resetButton.disabled = busy;
+    stopButton.hidden = !busy;
+    if (!busy) { clearPulse(); controller = null; }
+  }
+
   async function send(text) {
     addBubble('user', text);
     currentStep = null;
     const divider = el('div', 'hint', '— new message —');
     divider.style.margin = '12px 0 8px';
     loop.appendChild(divider);
-    sendButton.disabled = true;
+
+    controller = new AbortController();
+    let inactivityTimer = null;
+    let sawDone = false;
+    let sawError = false;
+    let stoppedByYou = false;
+    let timedOut = false;
+    const armTimer = () => {
+      clearTimeout(inactivityTimer);
+      inactivityTimer = setTimeout(() => { timedOut = true; controller.abort(); }, INACTIVITY_MS);
+    };
+    stopButton.onclick = () => { stoppedByYou = true; controller.abort(); };
+    setBusy(true);
+
     try {
+      armTimer();
       const response = await fetch(backendUrl('/chat'), {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ text, settings: modelOverrides() }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, settings: overridesForThisMessage() }),
+        signal: controller.signal,
       });
       if (!response.ok) {
         const err = await response.json().catch(() => ({ error: response.statusText }));
-        addBubble('error', err.error || 'request failed');
+        addBubble('error', (response.status === 409 ? 'The agent is still busy with the previous message. Wait a moment and try again. ' : '') + (err.error || 'request failed'));
+        sawError = true;
         return;
       }
       // Read the stream line by line. Each event is "data: {...}\n\n".
@@ -332,18 +408,33 @@
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
+        armTimer();
         buffer += decoder.decode(value, { stream: true });
         let boundary;
         while ((boundary = buffer.indexOf('\n\n')) >= 0) {
           const chunk = buffer.slice(0, boundary);
           buffer = buffer.slice(boundary + 2);
-          if (chunk.startsWith('data: ')) handleEvent(JSON.parse(chunk.slice(6)));
+          if (!chunk.startsWith('data: ')) continue;
+          const event = JSON.parse(chunk.slice(6));
+          if (event.type === 'done') sawDone = true;
+          if (event.type === 'error') sawError = true;
+          handleEvent(event);
         }
       }
+      if (!sawDone) {
+        addBubble('notice', 'The connection closed before the agent said it was finished. It may still be working on the server; the message list below will show what it did.');
+      }
     } catch (error) {
-      addBubble('error', 'Connection problem: ' + error.message);
+      if (stoppedByYou) {
+        addBubble('notice', 'Stopped listening. The server finishes the current turn on its own; Send is available again once it has (you may see "still busy" briefly).');
+      } else if (timedOut) {
+        addBubble('notice', 'Nothing arrived for ' + (INACTIVITY_MS / 1000) + ' seconds, so this page stopped waiting. The server may still be working; reload to see the state.');
+      } else {
+        addBubble('error', 'Connection problem: ' + error.message);
+      }
     } finally {
-      sendButton.disabled = false;
+      clearTimeout(inactivityTimer);
+      setBusy(false);
       refreshState();
       input.focus();
     }
@@ -359,11 +450,25 @@
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
   });
-  document.getElementById('reset').addEventListener('click', async () => {
-    await fetch(backendUrl('/reset'), { method: 'POST' });
-    chat.innerHTML = ''; loop.innerHTML = ''; currentStep = null;
+
+  resetButton.addEventListener('click', async () => {
+    if (resetButton.disabled) return;
+    let response;
+    try {
+      response = await fetch(backendUrl('/reset'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    } catch (error) {
+      addBubble('error', 'Could not reach the server to reset: ' + error.message);
+      return;
+    }
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ error: response.statusText }));
+      addBubble('error', 'Reset refused: ' + (err.error || response.statusText));
+      return;
+    }
+    chat.replaceChildren(); loop.replaceChildren(); currentStep = null;
     refreshState();
   });
+
   document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => {
     document.querySelectorAll('.tabs button').forEach(x => x.classList.remove('active'));
     b.classList.add('active');
@@ -371,20 +476,39 @@
     messagesPane.hidden = b.dataset.tab !== 'messages';
   }));
 
-  // ----- settings panel wiring -----------------------------------------------------
+  // ----- settings panel wiring ---------------------------------------------------------
   const panel = document.getElementById('settings');
-  const fields = { backend: 's-backend', api_key: 's-key', base_url: 's-base', model: 's-model' };
+  const settingsError = document.getElementById('s-error');
+  const fieldIds = { backend: 's-backend', base_url: 's-base', model: 's-model' };
   function fillSettingsForm() {
-    for (const [name, id] of Object.entries(fields)) document.getElementById(id).value = userSettings[name] || '';
+    for (const [name, id] of Object.entries(fieldIds)) document.getElementById(id).value = saved[name];
+    document.getElementById('s-key').value = sessionKey;
+    settingsError.textContent = '';
   }
   document.getElementById('settings-button').addEventListener('click', () => { fillSettingsForm(); panel.hidden = !panel.hidden; });
   document.getElementById('s-close').addEventListener('click', () => { panel.hidden = true; });
   document.getElementById('s-save').addEventListener('click', () => {
     const values = {};
-    for (const [name, id] of Object.entries(fields)) values[name] = document.getElementById(id).value.trim();
-    userSettings = values;
-    saveSettings(values);
+    for (const [name, id] of Object.entries(fieldIds)) values[name] = document.getElementById(id).value.trim();
+    const key = document.getElementById('s-key').value.trim();
+    const serverProvider = activeState ? activeState.base_url : '';
+    const providerChanged = values.base_url && values.base_url.replace(/\/$/, '') !== serverProvider.replace(/\/$/, '');
+    if (providerChanged && !key) {
+      settingsError.textContent = 'A different provider URL needs its own API key. Enter both together.';
+      return;
+    }
+    saved = values;
+    sessionKey = key;
+    storeSaved();
     panel.hidden = true;
+    refreshState();
+  });
+  document.getElementById('s-defaults').addEventListener('click', () => {
+    saved = { backend: '', base_url: '', model: '' };
+    sessionKey = '';
+    try { localStorage.removeItem(STORAGE_KEY); } catch (e) { /* ignore */ }
+    fillSettingsForm();
+    settingsError.textContent = 'Back to the server’s own settings.';
     refreshState();
   });
 

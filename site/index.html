@@ -992,7 +992,8 @@ python3 -m agent.server                       # chat in the browser at http://12
 <li>The <code>try/except</code> in <code>run_tool</code> → one bad argument from the model crashes the whole program.</li>
 <li><code>safe_path</code> → "read <code>../../.ssh/id_rsa</code>" works.</li>
 <li>The uniqueness check in <code>edit_file</code> → the model changes the wrong occurrence, silently.</li>
-<li>The timeout in <code>run_command</code> → a command that waits for input (<code>python3</code> with no file) hangs the agent forever.</li>
+<li>The timeout in <code>run_command</code> → a command that waits for input (<code>python3</code> with no file) hangs the agent forever. The blueprint clamps it to two minutes and kills the whole process group.</li>
+<li>The minimal environment in <code>run_command</code> → <code>env</code> would print your API key to the model.</li>
 <li><code>truncate_output</code> → one <code>pip install</code> log fills the context window.</li>
 </ul></div>
 
@@ -1031,121 +1032,179 @@ python3 -m agent.server                       # chat in the browser at http://12
 <span class="ln">  15</span>------
 <span class="ln">  16</span>The loop reports what it is doing by calling `on_event(event)` with a
 <span class="ln">  17</span>plain dictionary. The terminal prints them, the web page streams them,
-<span class="ln">  18</span>your own app can log them. The loop itself never prints.
-<span class="ln">  19</span>&quot;&quot;&quot;</span>
-<span class="ln">  20</span>
-<span class="ln">  21</span><span class="k">from</span> typing <span class="k">import</span> Callable
-<span class="ln">  22</span>
-<span class="ln">  23</span><span class="k">from</span> .context <span class="k">import</span> estimate_tokens, fit_context
-<span class="ln">  24</span><span class="k">from</span> .llm <span class="k">import</span> LLMError, ModelReply
-<span class="ln">  25</span><span class="k">from</span> .tools <span class="k">import</span> ToolRegistry
-<span class="ln">  26</span>
-<span class="ln">  27</span>Event = <span class="b">dict</span>
-<span class="ln">  28</span>EventHandler = Callable[[Event], <span class="k">None</span>]
-<span class="ln">  29</span>LLMFunction = Callable[[<span class="b">list</span>[<span class="b">dict</span>], <span class="b">list</span>[<span class="b">dict</span>]], ModelReply]
-<span class="ln">  30</span>
-<span class="ln">  31</span>
-<span class="ln">  32</span><span class="k">def</span> no_op(event: Event) -&gt; <span class="k">None</span>:
-<span class="ln">  33</span>    <span class="d">&quot;&quot;&quot;The default event handler: do nothing.&quot;&quot;&quot;</span>
-<span class="ln">  34</span>
-<span class="ln">  35</span>
-<span class="ln">  36</span><span class="k">class</span> Agent:
-<span class="ln">  37</span>    <span class="k">def</span> __init__(
-<span class="ln">  38</span>        self,
-<span class="ln">  39</span>        llm: LLMFunction,
-<span class="ln">  40</span>        tools: ToolRegistry,
-<span class="ln">  41</span>        system_prompt: <span class="b">str</span>,
-<span class="ln">  42</span>        max_steps: <span class="b">int</span> = <span class="n">25</span>,
-<span class="ln">  43</span>        context_window: <span class="b">int</span> = <span class="n">0</span>,
-<span class="ln">  44</span>    ):
-<span class="ln">  45</span>        self.llm = llm
-<span class="ln">  46</span>        self.tools = tools
-<span class="ln">  47</span>        self.max_steps = max_steps
-<span class="ln">  48</span>        self.context_window = context_window   <span class="c"># 0 means &quot;never compact&quot;</span>
-<span class="ln">  49</span>        self.messages: <span class="b">list</span>[<span class="b">dict</span>] = [{<span class="s">&quot;role&quot;</span>: <span class="s">&quot;system&quot;</span>, <span class="s">&quot;content&quot;</span>: system_prompt}]
-<span class="ln">  50</span>        self.total_usage = {<span class="s">&quot;prompt_tokens&quot;</span>: <span class="n">0</span>, <span class="s">&quot;completion_tokens&quot;</span>: <span class="n">0</span>}
-<span class="ln">  51</span>
-<span class="ln">  52</span>    <span class="k">def</span> run(self, user_text: <span class="b">str</span>, on_event: EventHandler = no_op) -&gt; <span class="b">str</span>:
-<span class="ln">  53</span>        <span class="d">&quot;&quot;&quot;Handle ONE user message all the way to a final answer.
+<span class="ln">  18</span>your own app can log them. The loop itself never prints. The event types:
+<span class="ln">  19</span>
+<span class="ln">  20</span>    user          the message that started this turn
+<span class="ln">  21</span>    compaction    old messages were shrunk to fit the window
+<span class="ln">  22</span>    model_call    about to ask the model (step number, message count)
+<span class="ln">  23</span>    model_reply   the model answered (did it ask for tools? how many?)
+<span class="ln">  24</span>    tool_call     one tool is about to run (name, arguments as JSON text)
+<span class="ln">  25</span>    tool_result   what that tool returned (text)
+<span class="ln">  26</span>    answer        the final text; the turn is over
+<span class="ln">  27</span>    error         something failed; the text says what and what was done
+<span class="ln">  28</span>
+<span class="ln">  29</span>A turn either finishes or is rolled back
+<span class="ln">  30</span>----------------------------------------
+<span class="ln">  31</span>If the model call fails (bad key, bad model name, network), the messages
+<span class="ln">  32</span>added during this turn are removed again, so the list never holds a
+<span class="ln">  33</span>half-finished turn. The next message starts from a clean state. Work the
+<span class="ln">  34</span>tools already did on disk is NOT undone; the error event says so.
+<span class="ln">  35</span>&quot;&quot;&quot;</span>
+<span class="ln">  36</span>
+<span class="ln">  37</span><span class="k">from</span> typing <span class="k">import</span> Callable
+<span class="ln">  38</span>
+<span class="ln">  39</span><span class="k">from</span> .context <span class="k">import</span> estimate_tokens, fit_context
+<span class="ln">  40</span><span class="k">from</span> .llm <span class="k">import</span> LLMError, ModelReply
+<span class="ln">  41</span><span class="k">from</span> .tools <span class="k">import</span> ToolRegistry
+<span class="ln">  42</span>
+<span class="ln">  43</span>Event = <span class="b">dict</span>
+<span class="ln">  44</span>EventHandler = Callable[[Event], <span class="k">None</span>]
+<span class="ln">  45</span>LLMFunction = Callable[[<span class="b">list</span>[<span class="b">dict</span>], <span class="b">list</span>[<span class="b">dict</span>]], ModelReply]
+<span class="ln">  46</span>
+<span class="ln">  47</span><span class="c"># More than this many tool calls in ONE reply is a model misbehaving, not a plan.</span>
+<span class="ln">  48</span>MAX_TOOL_CALLS_PER_REPLY = <span class="n">20</span>
+<span class="ln">  49</span>
+<span class="ln">  50</span>
+<span class="ln">  51</span><span class="k">def</span> no_op(event: Event) -&gt; <span class="k">None</span>:
+<span class="ln">  52</span>    <span class="d">&quot;&quot;&quot;The default event handler: do nothing.&quot;&quot;&quot;</span>
+<span class="ln">  53</span>
 <span class="ln">  54</span>
-<span class="ln">  55</span>        Returns the answer text. Everything that happened on the way is
-<span class="ln">  56</span>        reported through on_event.
-<span class="ln">  57</span>        &quot;&quot;&quot;</span>
-<span class="ln">  58</span>        self.messages.append({<span class="s">&quot;role&quot;</span>: <span class="s">&quot;user&quot;</span>, <span class="s">&quot;content&quot;</span>: user_text})
-<span class="ln">  59</span>        on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;user&quot;</span>, <span class="s">&quot;text&quot;</span>: user_text})
-<span class="ln">  60</span>
-<span class="ln">  61</span>        <span class="k">for</span> step <span class="k">in</span> <span class="b">range</span>(<span class="n">1</span>, self.max_steps + <span class="n">1</span>):
-<span class="ln">  62</span>            <span class="c"># ---- 0. Make sure the conversation still fits the window --------</span>
-<span class="ln">  63</span>            self._fit_context(on_event)
-<span class="ln">  64</span>
-<span class="ln">  65</span>            <span class="c"># ---- 1. REASON --------------------------------------------------</span>
-<span class="ln">  66</span>            on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;model_call&quot;</span>, <span class="s">&quot;step&quot;</span>: step, <span class="s">&quot;message_count&quot;</span>: <span class="b">len</span>(self.messages)})
-<span class="ln">  67</span>            <span class="k">try</span>:
-<span class="ln">  68</span>                reply = self.llm(self.messages, self.tools.schemas())
-<span class="ln">  69</span>            <span class="k">except</span> LLMError <span class="k">as</span> error:
-<span class="ln">  70</span>                on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;error&quot;</span>, <span class="s">&quot;step&quot;</span>: step, <span class="s">&quot;text&quot;</span>: <span class="b">str</span>(error)})
-<span class="ln">  71</span>                <span class="k">return</span> f&quot;Error: {error}&quot;
-<span class="ln">  72</span>
-<span class="ln">  73</span>            self._add_usage(reply.usage)
-<span class="ln">  74</span>            self.messages.append(reply.message)
-<span class="ln">  75</span>            tool_calls = reply.message.get(<span class="s">&quot;tool_calls&quot;</span>, [])
-<span class="ln">  76</span>            on_event({
-<span class="ln">  77</span>                <span class="s">&quot;type&quot;</span>: <span class="s">&quot;model_reply&quot;</span>,
-<span class="ln">  78</span>                <span class="s">&quot;step&quot;</span>: step,
-<span class="ln">  79</span>                <span class="s">&quot;finish_reason&quot;</span>: reply.finish_reason,
-<span class="ln">  80</span>                <span class="s">&quot;tool_call_count&quot;</span>: <span class="b">len</span>(tool_calls),
-<span class="ln">  81</span>                <span class="s">&quot;text&quot;</span>: reply.message.get(<span class="s">&quot;content&quot;</span>) <span class="k">or</span> <span class="s">&quot;&quot;</span>,
-<span class="ln">  82</span>                <span class="s">&quot;usage&quot;</span>: reply.usage,
-<span class="ln">  83</span>            })
+<span class="ln">  55</span><span class="k">class</span> Agent:
+<span class="ln">  56</span>    <span class="k">def</span> __init__(
+<span class="ln">  57</span>        self,
+<span class="ln">  58</span>        llm: LLMFunction,
+<span class="ln">  59</span>        tools: ToolRegistry,
+<span class="ln">  60</span>        system_prompt: <span class="b">str</span>,
+<span class="ln">  61</span>        max_steps: <span class="b">int</span> = <span class="n">25</span>,
+<span class="ln">  62</span>        context_window: <span class="b">int</span> = <span class="n">0</span>,
+<span class="ln">  63</span>    ):
+<span class="ln">  64</span>        self.llm = llm
+<span class="ln">  65</span>        self.tools = tools
+<span class="ln">  66</span>        self.max_steps = max_steps
+<span class="ln">  67</span>        self.context_window = context_window   <span class="c"># 0 means &quot;never compact&quot;</span>
+<span class="ln">  68</span>        self.messages: <span class="b">list</span>[<span class="b">dict</span>] = [{<span class="s">&quot;role&quot;</span>: <span class="s">&quot;system&quot;</span>, <span class="s">&quot;content&quot;</span>: system_prompt}]
+<span class="ln">  69</span>        self.total_usage = {<span class="s">&quot;prompt_tokens&quot;</span>: <span class="n">0</span>, <span class="s">&quot;completion_tokens&quot;</span>: <span class="n">0</span>}
+<span class="ln">  70</span>
+<span class="ln">  71</span>    <span class="k">def</span> run(self, user_text: <span class="b">str</span>, on_event: EventHandler = no_op) -&gt; <span class="b">str</span>:
+<span class="ln">  72</span>        <span class="d">&quot;&quot;&quot;Handle ONE user message all the way to a final answer.
+<span class="ln">  73</span>
+<span class="ln">  74</span>        Returns the answer text. Everything that happened on the way is
+<span class="ln">  75</span>        reported through on_event.
+<span class="ln">  76</span>        &quot;&quot;&quot;</span>
+<span class="ln">  77</span>        user_message = {<span class="s">&quot;role&quot;</span>: <span class="s">&quot;user&quot;</span>, <span class="s">&quot;content&quot;</span>: user_text}
+<span class="ln">  78</span>        self.messages.append(user_message)
+<span class="ln">  79</span>        on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;user&quot;</span>, <span class="s">&quot;text&quot;</span>: user_text})
+<span class="ln">  80</span>
+<span class="ln">  81</span>        <span class="k">for</span> step <span class="k">in</span> <span class="b">range</span>(<span class="n">1</span>, self.max_steps + <span class="n">1</span>):
+<span class="ln">  82</span>            <span class="c"># ---- 0. Make sure the conversation still fits the window --------</span>
+<span class="ln">  83</span>            self._fit_context(on_event)
 <span class="ln">  84</span>
-<span class="ln">  85</span>            <span class="c"># ---- No tool calls means the model has finished. ----------------</span>
-<span class="ln">  86</span>            <span class="k">if</span> <span class="k">not</span> tool_calls:
-<span class="ln">  87</span>                answer = reply.message.get(<span class="s">&quot;content&quot;</span>) <span class="k">or</span> <span class="s">&quot;&quot;</span>
-<span class="ln">  88</span>                on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;answer&quot;</span>, <span class="s">&quot;step&quot;</span>: step, <span class="s">&quot;text&quot;</span>: answer})
-<span class="ln">  89</span>                <span class="k">return</span> answer
-<span class="ln">  90</span>
-<span class="ln">  91</span>            <span class="c"># ---- 2. ACT and 3. OBSERVE, once per requested call ------------</span>
-<span class="ln">  92</span>            <span class="k">for</span> call <span class="k">in</span> tool_calls:
-<span class="ln">  93</span>                name = call[<span class="s">&quot;function&quot;</span>][<span class="s">&quot;name&quot;</span>]
-<span class="ln">  94</span>                arguments_json = call[<span class="s">&quot;function&quot;</span>][<span class="s">&quot;arguments&quot;</span>]
-<span class="ln">  95</span>                on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;tool_call&quot;</span>, <span class="s">&quot;step&quot;</span>: step, <span class="s">&quot;id&quot;</span>: call[<span class="s">&quot;id&quot;</span>], <span class="s">&quot;name&quot;</span>: name, <span class="s">&quot;arguments&quot;</span>: arguments_json})
-<span class="ln">  96</span>
-<span class="ln">  97</span>                result = self.tools.run(name, arguments_json)
+<span class="ln">  85</span>            <span class="c"># ---- 1. REASON --------------------------------------------------</span>
+<span class="ln">  86</span>            on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;model_call&quot;</span>, <span class="s">&quot;step&quot;</span>: step, <span class="s">&quot;message_count&quot;</span>: <span class="b">len</span>(self.messages)})
+<span class="ln">  87</span>            <span class="k">try</span>:
+<span class="ln">  88</span>                reply = self.llm(self.messages, self.tools.schemas())
+<span class="ln">  89</span>            <span class="k">except</span> LLMError <span class="k">as</span> error:
+<span class="ln">  90</span>                removed = self._roll_back(user_message)
+<span class="ln">  91</span>                on_event({
+<span class="ln">  92</span>                    <span class="s">&quot;type&quot;</span>: <span class="s">&quot;error&quot;</span>,
+<span class="ln">  93</span>                    <span class="s">&quot;step&quot;</span>: step,
+<span class="ln">  94</span>                    <span class="s">&quot;text&quot;</span>: f&quot;{error}\nThis message was removed from the conversation ({removed} messages rolled back); &quot;
+<span class="ln">  95</span>                            <span class="s">&quot;files the tools already changed stay changed.&quot;</span>,
+<span class="ln">  96</span>                })
+<span class="ln">  97</span>                <span class="k">return</span> f&quot;Error: {error}&quot;
 <span class="ln">  98</span>
-<span class="ln">  99</span>                <span class="c"># The API insists: every tool call gets exactly one tool</span>
-<span class="ln"> 100</span>                <span class="c"># message, linked by tool_call_id, before the next model call.</span>
-<span class="ln"> 101</span>                self.messages.append({<span class="s">&quot;role&quot;</span>: <span class="s">&quot;tool&quot;</span>, <span class="s">&quot;tool_call_id&quot;</span>: call[<span class="s">&quot;id&quot;</span>], <span class="s">&quot;content&quot;</span>: result})
-<span class="ln"> 102</span>                on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;tool_result&quot;</span>, <span class="s">&quot;step&quot;</span>: step, <span class="s">&quot;id&quot;</span>: call[<span class="s">&quot;id&quot;</span>], <span class="s">&quot;name&quot;</span>: name, <span class="s">&quot;result&quot;</span>: result})
-<span class="ln"> 103</span>
-<span class="ln"> 104</span>            <span class="c"># Loop round: the model now sees the results and decides again.</span>
-<span class="ln"> 105</span>
-<span class="ln"> 106</span>        <span class="c"># The brake: too many steps for one message. Stop and say so.</span>
-<span class="ln"> 107</span>        text = f&quot;Stopped after {self.max_steps} steps without a final answer.&quot;
-<span class="ln"> 108</span>        on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;error&quot;</span>, <span class="s">&quot;step&quot;</span>: self.max_steps, <span class="s">&quot;text&quot;</span>: text})
-<span class="ln"> 109</span>        self.messages.append({<span class="s">&quot;role&quot;</span>: <span class="s">&quot;assistant&quot;</span>, <span class="s">&quot;content&quot;</span>: text})
-<span class="ln"> 110</span>        <span class="k">return</span> text
-<span class="ln"> 111</span>
-<span class="ln"> 112</span>    <span class="k">def</span> reset(self) -&gt; <span class="k">None</span>:
-<span class="ln"> 113</span>        <span class="d">&quot;&quot;&quot;Forget the conversation but keep the system prompt.&quot;&quot;&quot;</span>
-<span class="ln"> 114</span>        self.messages = self.messages[:<span class="n">1</span>]
-<span class="ln"> 115</span>        self.total_usage = {<span class="s">&quot;prompt_tokens&quot;</span>: <span class="n">0</span>, <span class="s">&quot;completion_tokens&quot;</span>: <span class="n">0</span>}
+<span class="ln">  99</span>            self._add_usage(reply.usage)
+<span class="ln"> 100</span>            self.messages.append(reply.message)
+<span class="ln"> 101</span>            tool_calls = reply.message.get(<span class="s">&quot;tool_calls&quot;</span>, [])
+<span class="ln"> 102</span>            on_event({
+<span class="ln"> 103</span>                <span class="s">&quot;type&quot;</span>: <span class="s">&quot;model_reply&quot;</span>,
+<span class="ln"> 104</span>                <span class="s">&quot;step&quot;</span>: step,
+<span class="ln"> 105</span>                <span class="s">&quot;finish_reason&quot;</span>: reply.finish_reason,
+<span class="ln"> 106</span>                <span class="s">&quot;tool_call_count&quot;</span>: <span class="b">len</span>(tool_calls),
+<span class="ln"> 107</span>                <span class="s">&quot;text&quot;</span>: reply.message.get(<span class="s">&quot;content&quot;</span>) <span class="k">or</span> <span class="s">&quot;&quot;</span>,
+<span class="ln"> 108</span>                <span class="s">&quot;usage&quot;</span>: reply.usage,
+<span class="ln"> 109</span>            })
+<span class="ln"> 110</span>
+<span class="ln"> 111</span>            <span class="c"># ---- No tool calls means the model has finished. ----------------</span>
+<span class="ln"> 112</span>            <span class="k">if</span> <span class="k">not</span> tool_calls:
+<span class="ln"> 113</span>                answer = reply.message.get(<span class="s">&quot;content&quot;</span>) <span class="k">or</span> <span class="s">&quot;&quot;</span>
+<span class="ln"> 114</span>                on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;answer&quot;</span>, <span class="s">&quot;step&quot;</span>: step, <span class="s">&quot;text&quot;</span>: answer})
+<span class="ln"> 115</span>                <span class="k">return</span> answer
 <span class="ln"> 116</span>
-<span class="ln"> 117</span>    <span class="k">def</span> _fit_context(self, on_event: EventHandler) -&gt; <span class="k">None</span>:
-<span class="ln"> 118</span>        <span class="d">&quot;&quot;&quot;Shrink old messages when the estimate passes 80% of the window.&quot;&quot;&quot;</span>
-<span class="ln"> 119</span>        <span class="k">if</span> self.context_window &lt;= <span class="n">0</span>:
-<span class="ln"> 120</span>            <span class="k">return</span>
-<span class="ln"> 121</span>        budget = <span class="b">int</span>(self.context_window * <span class="n">0.8</span>)
-<span class="ln"> 122</span>        before = estimate_tokens(self.messages)
-<span class="ln"> 123</span>        <span class="k">if</span> before &lt;= budget:
-<span class="ln"> 124</span>            <span class="k">return</span>
-<span class="ln"> 125</span>        self.messages = fit_context(self.messages, budget, self.llm)
-<span class="ln"> 126</span>        after = estimate_tokens(self.messages)
-<span class="ln"> 127</span>        <span class="k">if</span> after &lt; before:
-<span class="ln"> 128</span>            on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;compaction&quot;</span>, <span class="s">&quot;before_tokens&quot;</span>: before, <span class="s">&quot;after_tokens&quot;</span>: after})
-<span class="ln"> 129</span>
-<span class="ln"> 130</span>    <span class="k">def</span> _add_usage(self, usage: <span class="b">dict</span>) -&gt; <span class="k">None</span>:
-<span class="ln"> 131</span>        <span class="k">for</span> key <span class="k">in</span> self.total_usage:
-<span class="ln"> 132</span>            self.total_usage[key] += <span class="b">int</span>(usage.get(key, <span class="n">0</span>) <span class="k">or</span> <span class="n">0</span>)</code></pre></figure></details>
+<span class="ln"> 117</span>            <span class="c"># ---- 2. ACT and 3. OBSERVE, once per requested call ------------</span>
+<span class="ln"> 118</span>            cut_off = reply.finish_reason == <span class="s">&quot;length&quot;</span>   <span class="c"># the reply hit the output limit</span>
+<span class="ln"> 119</span>            <span class="k">for</span> number, call <span class="k">in</span> enumerate(tool_calls, start=<span class="n">1</span>):
+<span class="ln"> 120</span>                name = call[<span class="s">&quot;function&quot;</span>][<span class="s">&quot;name&quot;</span>]
+<span class="ln"> 121</span>                arguments_json = call[<span class="s">&quot;function&quot;</span>][<span class="s">&quot;arguments&quot;</span>]
+<span class="ln"> 122</span>                on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;tool_call&quot;</span>, <span class="s">&quot;step&quot;</span>: step, <span class="s">&quot;id&quot;</span>: call[<span class="s">&quot;id&quot;</span>], <span class="s">&quot;name&quot;</span>: name, <span class="s">&quot;arguments&quot;</span>: arguments_json})
+<span class="ln"> 123</span>
+<span class="ln"> 124</span>                <span class="k">if</span> cut_off:
+<span class="ln"> 125</span>                    result = (<span class="s">&quot;Error: your reply was cut off by the output limit, so these arguments may be &quot;</span>
+<span class="ln"> 126</span>                              <span class="s">&quot;incomplete. The tool was not run. Re-issue the call with complete arguments.&quot;</span>)
+<span class="ln"> 127</span>                <span class="k">elif</span> number &gt; MAX_TOOL_CALLS_PER_REPLY:
+<span class="ln"> 128</span>                    result = (f&quot;Error: more than {MAX_TOOL_CALLS_PER_REPLY} tool calls in one reply. &quot;
+<span class="ln"> 129</span>                              <span class="s">&quot;This call was not run. Ask for fewer calls at a time.&quot;</span>)
+<span class="ln"> 130</span>                <span class="k">else</span>:
+<span class="ln"> 131</span>                    result = self.tools.run(name, arguments_json)
+<span class="ln"> 132</span>
+<span class="ln"> 133</span>                <span class="c"># The API insists: every tool call gets exactly one tool</span>
+<span class="ln"> 134</span>                <span class="c"># message, linked by tool_call_id, before the next model call.</span>
+<span class="ln"> 135</span>                self.messages.append({<span class="s">&quot;role&quot;</span>: <span class="s">&quot;tool&quot;</span>, <span class="s">&quot;tool_call_id&quot;</span>: call[<span class="s">&quot;id&quot;</span>], <span class="s">&quot;content&quot;</span>: result})
+<span class="ln"> 136</span>                on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;tool_result&quot;</span>, <span class="s">&quot;step&quot;</span>: step, <span class="s">&quot;id&quot;</span>: call[<span class="s">&quot;id&quot;</span>], <span class="s">&quot;name&quot;</span>: name, <span class="s">&quot;result&quot;</span>: result})
+<span class="ln"> 137</span>
+<span class="ln"> 138</span>            <span class="c"># Loop round: the model now sees the results and decides again.</span>
+<span class="ln"> 139</span>
+<span class="ln"> 140</span>        <span class="c"># The brake: too many steps for one message. Stop and say so.</span>
+<span class="ln"> 141</span>        text = f&quot;Stopped after {self.max_steps} steps without a final answer.&quot;
+<span class="ln"> 142</span>        on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;error&quot;</span>, <span class="s">&quot;step&quot;</span>: self.max_steps, <span class="s">&quot;text&quot;</span>: text})
+<span class="ln"> 143</span>        self.messages.append({<span class="s">&quot;role&quot;</span>: <span class="s">&quot;assistant&quot;</span>, <span class="s">&quot;content&quot;</span>: text})
+<span class="ln"> 144</span>        <span class="k">return</span> text
+<span class="ln"> 145</span>
+<span class="ln"> 146</span>    <span class="k">def</span> reset(self) -&gt; <span class="k">None</span>:
+<span class="ln"> 147</span>        <span class="d">&quot;&quot;&quot;Forget the conversation but keep the system prompt.&quot;&quot;&quot;</span>
+<span class="ln"> 148</span>        self.messages = self.messages[:<span class="n">1</span>]
+<span class="ln"> 149</span>        self.total_usage = {<span class="s">&quot;prompt_tokens&quot;</span>: <span class="n">0</span>, <span class="s">&quot;completion_tokens&quot;</span>: <span class="n">0</span>}
+<span class="ln"> 150</span>
+<span class="ln"> 151</span>    <span class="k">def</span> _roll_back(self, user_message: <span class="b">dict</span>) -&gt; <span class="b">int</span>:
+<span class="ln"> 152</span>        <span class="d">&quot;&quot;&quot;Remove this turn&#x27;s messages. Returns how many were removed.
+<span class="ln"> 153</span>
+<span class="ln"> 154</span>        We look for the exact user message object that started the turn;
+<span class="ln"> 155</span>        everything from it to the end belongs to this turn. If compaction
+<span class="ln"> 156</span>        summarised it away already, we add a short assistant note instead,
+<span class="ln"> 157</span>        so the list stays well formed either way.
+<span class="ln"> 158</span>        &quot;&quot;&quot;</span>
+<span class="ln"> 159</span>        <span class="k">for</span> index, message <span class="k">in</span> enumerate(self.messages):
+<span class="ln"> 160</span>            <span class="k">if</span> message <span class="k">is</span> user_message:
+<span class="ln"> 161</span>                removed = <span class="b">len</span>(self.messages) - index
+<span class="ln"> 162</span>                <span class="k">del</span> self.messages[index:]
+<span class="ln"> 163</span>                <span class="k">return</span> removed
+<span class="ln"> 164</span>        self.messages.append({<span class="s">&quot;role&quot;</span>: <span class="s">&quot;assistant&quot;</span>, <span class="s">&quot;content&quot;</span>: <span class="s">&quot;The previous request failed and was abandoned.&quot;</span>})
+<span class="ln"> 165</span>        <span class="k">return</span> <span class="n">0</span>
+<span class="ln"> 166</span>
+<span class="ln"> 167</span>    <span class="k">def</span> _fit_context(self, on_event: EventHandler) -&gt; <span class="k">None</span>:
+<span class="ln"> 168</span>        <span class="d">&quot;&quot;&quot;Shrink old messages when the estimate passes 80% of the window.
+<span class="ln"> 169</span>
+<span class="ln"> 170</span>        A failure here (the summariser is a model call too) is reported as
+<span class="ln"> 171</span>        an error event and the turn continues with the unshrunk list.
+<span class="ln"> 172</span>        &quot;&quot;&quot;</span>
+<span class="ln"> 173</span>        <span class="k">if</span> self.context_window &lt;= <span class="n">0</span>:
+<span class="ln"> 174</span>            <span class="k">return</span>
+<span class="ln"> 175</span>        budget = <span class="b">int</span>(self.context_window * <span class="n">0.8</span>)
+<span class="ln"> 176</span>        before = estimate_tokens(self.messages)
+<span class="ln"> 177</span>        <span class="k">if</span> before &lt;= budget:
+<span class="ln"> 178</span>            <span class="k">return</span>
+<span class="ln"> 179</span>        <span class="k">try</span>:
+<span class="ln"> 180</span>            self.messages = fit_context(self.messages, budget, self.llm)
+<span class="ln"> 181</span>        <span class="k">except</span> LLMError <span class="k">as</span> error:
+<span class="ln"> 182</span>            on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;error&quot;</span>, <span class="s">&quot;text&quot;</span>: f&quot;Compaction failed, continuing without it: {error}&quot;})
+<span class="ln"> 183</span>            <span class="k">return</span>
+<span class="ln"> 184</span>        after = estimate_tokens(self.messages)
+<span class="ln"> 185</span>        <span class="k">if</span> after &lt; before:
+<span class="ln"> 186</span>            on_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;compaction&quot;</span>, <span class="s">&quot;before_tokens&quot;</span>: before, <span class="s">&quot;after_tokens&quot;</span>: after})
+<span class="ln"> 187</span>
+<span class="ln"> 188</span>    <span class="k">def</span> _add_usage(self, usage: <span class="b">dict</span>) -&gt; <span class="k">None</span>:
+<span class="ln"> 189</span>        <span class="k">for</span> key <span class="k">in</span> self.total_usage:
+<span class="ln"> 190</span>            self.total_usage[key] += <span class="b">int</span>(usage.get(key, <span class="n">0</span>) <span class="k">or</span> <span class="n">0</span>)</code></pre></figure></details>
 <details><summary>Tools and the registry: agent/tools.py</summary><figure class="code"><figcaption><span class="path">agent/tools.py</span><span class="hint">real file, embedded at build time</span></figcaption><pre><code><span class="ln">   1</span><span class="d">&quot;&quot;&quot;
 <span class="ln">   2</span>tools.py - what a tool is, and the registry that runs them.
 <span class="ln">   3</span>
@@ -1240,248 +1299,343 @@ python3 -m agent.server                       # chat in the browser at http://12
 <span class="ln">   2</span>workspace.py - the five coding tools, locked to one folder.
 <span class="ln">   3</span>
 <span class="ln">   4</span>A coding agent needs to look around, read, write, edit and run things.
-<span class="ln">   5</span>Every one of those actions goes through a Workspace object, and every
-<span class="ln">   6</span>path is checked so the agent cannot wander outside its root folder.
-<span class="ln">   7</span>
-<span class="ln">   8</span>Each tool returns TEXT. The model reads that text and decides what to do
-<span class="ln">   9</span>next. Errors are also text (see tools.py for why).
-<span class="ln">  10</span>&quot;&quot;&quot;</span>
-<span class="ln">  11</span>
-<span class="ln">  12</span><span class="k">import</span> os
-<span class="ln">  13</span><span class="k">import</span> subprocess
-<span class="ln">  14</span>
-<span class="ln">  15</span><span class="k">from</span> .tools <span class="k">import</span> Tool
-<span class="ln">  16</span>
-<span class="ln">  17</span><span class="c"># How much of a tool&#x27;s output the model gets to see. Huge outputs waste the</span>
-<span class="ln">  18</span><span class="c"># context window and hide the useful part, so we keep the head and the tail.</span>
-<span class="ln">  19</span>MAX_OUTPUT_CHARS = <span class="n">12_000</span>
-<span class="ln">  20</span>MAX_LIST_ENTRIES = <span class="n">300</span>
-<span class="ln">  21</span>SKIP_DIRS = {<span class="s">&quot;.git&quot;</span>, <span class="s">&quot;__pycache__&quot;</span>, <span class="s">&quot;node_modules&quot;</span>, <span class="s">&quot;.venv&quot;</span>, <span class="s">&quot;.wrangler&quot;</span>}
-<span class="ln">  22</span>
+<span class="ln">   5</span>Every one of those actions goes through a Workspace object. The four FILE
+<span class="ln">   6</span>tools check every path so the model cannot read or write outside the root
+<span class="ln">   7</span>folder. The SHELL tool is different, and honesty matters here:
+<span class="ln">   8</span>
+<span class="ln">   9</span>    run_command starts a real shell as YOU, with your permissions. Its
+<span class="ln">  10</span>    working directory is the workspace, but a shell can `cd ..` or read
+<span class="ln">  11</span>    any file you can read. The workspace is a convenience for the file
+<span class="ln">  12</span>    tools, not a security boundary for the shell.
+<span class="ln">  13</span>
+<span class="ln">  14</span>What this file does about that: the command gets a minimal environment
+<span class="ln">  15</span>(no API keys), a clamped timeout, its whole process group is killed on
+<span class="ln">  16</span>timeout, and captured output is capped. A real boundary needs an
+<span class="ln">  17</span>operating-system sandbox: on the hosted version that is Cloudflare&#x27;s
+<span class="ln">  18</span>container; on your own machine it is out of this blueprint&#x27;s scope.
+<span class="ln">  19</span>
+<span class="ln">  20</span>Each tool returns TEXT. The model reads that text and decides what to do
+<span class="ln">  21</span>next. Errors are also text (see tools.py for why).
+<span class="ln">  22</span>&quot;&quot;&quot;</span>
 <span class="ln">  23</span>
-<span class="ln">  24</span><span class="k">class</span> Workspace:
-<span class="ln">  25</span>    <span class="k">def</span> __init__(self, root: <span class="b">str</span>):
-<span class="ln">  26</span>        self.root = os.path.realpath(root)
-<span class="ln">  27</span>        os.makedirs(self.root, exist_ok=<span class="k">True</span>)
+<span class="ln">  24</span><span class="k">import</span> os
+<span class="ln">  25</span><span class="k">import</span> signal
+<span class="ln">  26</span><span class="k">import</span> subprocess
+<span class="ln">  27</span><span class="k">import</span> tempfile
 <span class="ln">  28</span>
-<span class="ln">  29</span>    <span class="c"># ----- safety ---------------------------------------------------------</span>
+<span class="ln">  29</span><span class="k">from</span> .tools <span class="k">import</span> Tool
 <span class="ln">  30</span>
-<span class="ln">  31</span>    <span class="k">def</span> safe_path(self, relative_path: <span class="b">str</span>) -&gt; <span class="b">str</span>:
-<span class="ln">  32</span>        <span class="d">&quot;&quot;&quot;Turn a path the model wrote into a real path INSIDE the root.
-<span class="ln">  33</span>
-<span class="ln">  34</span>        realpath() follows symlinks and removes &#x27;..&#x27;, so a path that looks
-<span class="ln">  35</span>        innocent but leads outside the folder is caught here.
-<span class="ln">  36</span>        &quot;&quot;&quot;</span>
-<span class="ln">  37</span>        candidate = os.path.realpath(os.path.join(self.root, relative_path))
-<span class="ln">  38</span>        is_root = candidate == self.root
-<span class="ln">  39</span>        is_inside = candidate.startswith(self.root + os.sep)
-<span class="ln">  40</span>        <span class="k">if</span> <span class="k">not</span> (is_root <span class="k">or</span> is_inside):
-<span class="ln">  41</span>            <span class="k">raise</span> ValueError(f&quot;{relative_path!r} is outside the workspace and was refused.&quot;)
-<span class="ln">  42</span>        <span class="k">return</span> candidate
-<span class="ln">  43</span>
-<span class="ln">  44</span>    <span class="c"># ----- the five tools ---------------------------------------------------</span>
-<span class="ln">  45</span>
-<span class="ln">  46</span>    <span class="k">def</span> list_files(self, path: <span class="b">str</span> = <span class="s">&quot;.&quot;</span>) -&gt; <span class="b">str</span>:
-<span class="ln">  47</span>        <span class="d">&quot;&quot;&quot;List files and folders under `path` (recursive), one per line.&quot;&quot;&quot;</span>
-<span class="ln">  48</span>        start = self.safe_path(path)
-<span class="ln">  49</span>        <span class="k">if</span> <span class="k">not</span> os.path.isdir(start):
-<span class="ln">  50</span>            <span class="k">return</span> f&quot;Error: {path!r} is not a folder.&quot;
-<span class="ln">  51</span>        lines = []
-<span class="ln">  52</span>        <span class="k">for</span> folder, subfolders, files <span class="k">in</span> os.walk(start):
-<span class="ln">  53</span>            subfolders[:] = sorted(name <span class="k">for</span> name <span class="k">in</span> subfolders <span class="k">if</span> name <span class="k">not</span> <span class="k">in</span> SKIP_DIRS)
-<span class="ln">  54</span>            <span class="k">for</span> name <span class="k">in</span> sorted(files):
-<span class="ln">  55</span>                full = os.path.join(folder, name)
-<span class="ln">  56</span>                shown = os.path.relpath(full, self.root)
-<span class="ln">  57</span>                size = os.path.getsize(full)
-<span class="ln">  58</span>                lines.append(f&quot;{shown}  ({size} bytes)&quot;)
-<span class="ln">  59</span>                <span class="k">if</span> <span class="b">len</span>(lines) &gt;= MAX_LIST_ENTRIES:
-<span class="ln">  60</span>                    lines.append(f&quot;... stopped after {MAX_LIST_ENTRIES} entries&quot;)
-<span class="ln">  61</span>                    <span class="k">return</span> <span class="s">&quot;\n&quot;</span>.join(lines)
-<span class="ln">  62</span>        <span class="k">if</span> <span class="k">not</span> lines:
-<span class="ln">  63</span>            <span class="k">return</span> <span class="s">&quot;(the folder is empty)&quot;</span>
-<span class="ln">  64</span>        <span class="k">return</span> <span class="s">&quot;\n&quot;</span>.join(lines)
-<span class="ln">  65</span>
-<span class="ln">  66</span>    <span class="k">def</span> read_file(self, path: <span class="b">str</span>, start_line: <span class="b">int</span> = <span class="n">1</span>, max_lines: <span class="b">int</span> = <span class="n">400</span>) -&gt; <span class="b">str</span>:
-<span class="ln">  67</span>        <span class="d">&quot;&quot;&quot;Return the file&#x27;s text with line numbers, e.g. &#x27;  12| print(x)&#x27;.
-<span class="ln">  68</span>
-<span class="ln">  69</span>        Line numbers matter: they let the model quote exact lines back when
-<span class="ln">  70</span>        it edits, and let you check its claims against the real file.
-<span class="ln">  71</span>        &quot;&quot;&quot;</span>
-<span class="ln">  72</span>        full = self.safe_path(path)
-<span class="ln">  73</span>        <span class="k">if</span> <span class="k">not</span> os.path.isfile(full):
-<span class="ln">  74</span>            <span class="k">return</span> f&quot;Error: {path!r} does not exist.&quot;
-<span class="ln">  75</span>        <span class="k">with</span> <span class="b">open</span>(full, encoding=<span class="s">&quot;utf-8&quot;</span>, errors=<span class="s">&quot;replace&quot;</span>) <span class="k">as</span> file:
-<span class="ln">  76</span>            all_lines = file.read().splitlines()
-<span class="ln">  77</span>        first = max(start_line, <span class="n">1</span>)
-<span class="ln">  78</span>        last = min(first + max_lines - <span class="n">1</span>, <span class="b">len</span>(all_lines))
-<span class="ln">  79</span>        numbered = []
-<span class="ln">  80</span>        <span class="k">for</span> number <span class="k">in</span> <span class="b">range</span>(first, last + <span class="n">1</span>):
-<span class="ln">  81</span>            numbered.append(f&quot;{number:5d}| {all_lines[number - <span class="n">1</span>]}&quot;)
-<span class="ln">  82</span>        header = f&quot;{path} (lines {first}-{last} of {<span class="b">len</span>(all_lines)})\n&quot;
-<span class="ln">  83</span>        <span class="k">return</span> truncate_output(header + <span class="s">&quot;\n&quot;</span>.join(numbered))
-<span class="ln">  84</span>
-<span class="ln">  85</span>    <span class="k">def</span> write_file(self, path: <span class="b">str</span>, content: <span class="b">str</span>) -&gt; <span class="b">str</span>:
-<span class="ln">  86</span>        <span class="d">&quot;&quot;&quot;Create or completely replace a file.&quot;&quot;&quot;</span>
-<span class="ln">  87</span>        full = self.safe_path(path)
-<span class="ln">  88</span>        os.makedirs(os.path.dirname(full), exist_ok=<span class="k">True</span>)
-<span class="ln">  89</span>        <span class="k">with</span> <span class="b">open</span>(full, <span class="s">&quot;w&quot;</span>, encoding=<span class="s">&quot;utf-8&quot;</span>) <span class="k">as</span> file:
-<span class="ln">  90</span>            file.write(content)
-<span class="ln">  91</span>        <span class="k">return</span> f&quot;Wrote {<span class="b">len</span>(content)} characters to {path}.&quot;
-<span class="ln">  92</span>
-<span class="ln">  93</span>    <span class="k">def</span> edit_file(self, path: <span class="b">str</span>, old_text: <span class="b">str</span>, new_text: <span class="b">str</span>) -&gt; <span class="b">str</span>:
-<span class="ln">  94</span>        <span class="d">&quot;&quot;&quot;Replace ONE exact occurrence of old_text with new_text.
-<span class="ln">  95</span>
-<span class="ln">  96</span>        Exactness is the safety feature. If old_text is missing the model
-<span class="ln">  97</span>        is told so; if it appears twice the model must include more context.
-<span class="ln">  98</span>        Either way nothing is changed until the match is unambiguous.
-<span class="ln">  99</span>        &quot;&quot;&quot;</span>
-<span class="ln"> 100</span>        full = self.safe_path(path)
-<span class="ln"> 101</span>        <span class="k">if</span> <span class="k">not</span> os.path.isfile(full):
-<span class="ln"> 102</span>            <span class="k">return</span> f&quot;Error: {path!r} does not exist. Use write_file to create it.&quot;
-<span class="ln"> 103</span>        <span class="k">with</span> <span class="b">open</span>(full, encoding=<span class="s">&quot;utf-8&quot;</span>) <span class="k">as</span> file:
-<span class="ln"> 104</span>            original = file.read()
-<span class="ln"> 105</span>        occurrences = original.count(old_text)
-<span class="ln"> 106</span>        <span class="k">if</span> occurrences == <span class="n">0</span>:
-<span class="ln"> 107</span>            <span class="k">return</span> <span class="s">&quot;Error: old_text was not found in the file. Read the file and copy the text exactly.&quot;</span>
-<span class="ln"> 108</span>        <span class="k">if</span> occurrences &gt; <span class="n">1</span>:
-<span class="ln"> 109</span>            <span class="k">return</span> f&quot;Error: old_text appears {occurrences} times. Include more surrounding lines so it is unique.&quot;
-<span class="ln"> 110</span>        updated = original.replace(old_text, new_text, <span class="n">1</span>)
+<span class="ln">  31</span><span class="c"># How much of a tool&#x27;s output the model gets to see. Huge outputs waste the</span>
+<span class="ln">  32</span><span class="c"># context window and hide the useful part, so we keep the head and the tail.</span>
+<span class="ln">  33</span>MAX_OUTPUT_CHARS = <span class="n">12_000</span>
+<span class="ln">  34</span>MAX_LIST_ENTRIES = <span class="n">300</span>
+<span class="ln">  35</span>MAX_WRITE_CHARS = <span class="n">2_000_000</span>          <span class="c"># one write_file call; bigger is almost certainly a mistake</span>
+<span class="ln">  36</span>MAX_INSTRUCTIONS_CHARS = <span class="n">20_000</span>      <span class="c"># AGENTS.md is a note, not a manual</span>
+<span class="ln">  37</span>MAX_COMMAND_SECONDS = <span class="n">120</span>            <span class="c"># the longest any single command may run</span>
+<span class="ln">  38</span>MAX_CAPTURE_BYTES = <span class="n">200_000</span>          <span class="c"># read at most this much of a command&#x27;s output into memory</span>
+<span class="ln">  39</span>SKIP_DIRS = {<span class="s">&quot;.git&quot;</span>, <span class="s">&quot;__pycache__&quot;</span>, <span class="s">&quot;node_modules&quot;</span>, <span class="s">&quot;.venv&quot;</span>, <span class="s">&quot;.wrangler&quot;</span>}
+<span class="ln">  40</span>
+<span class="ln">  41</span>
+<span class="ln">  42</span><span class="k">class</span> Workspace:
+<span class="ln">  43</span>    <span class="k">def</span> __init__(self, root: <span class="b">str</span>):
+<span class="ln">  44</span>        self.root = os.path.realpath(root)
+<span class="ln">  45</span>        os.makedirs(self.root, exist_ok=<span class="k">True</span>)
+<span class="ln">  46</span>
+<span class="ln">  47</span>    <span class="c"># ----- safety ---------------------------------------------------------</span>
+<span class="ln">  48</span>
+<span class="ln">  49</span>    <span class="k">def</span> safe_path(self, relative_path: <span class="b">str</span>) -&gt; <span class="b">str</span>:
+<span class="ln">  50</span>        <span class="d">&quot;&quot;&quot;Turn a path the model wrote into a real path INSIDE the root.
+<span class="ln">  51</span>
+<span class="ln">  52</span>        realpath() follows symlinks and removes &#x27;..&#x27;, so a path that looks
+<span class="ln">  53</span>        innocent but leads outside the folder is caught here.
+<span class="ln">  54</span>        &quot;&quot;&quot;</span>
+<span class="ln">  55</span>        candidate = os.path.realpath(os.path.join(self.root, relative_path))
+<span class="ln">  56</span>        is_root = candidate == self.root
+<span class="ln">  57</span>        is_inside = candidate.startswith(self.root + os.sep)
+<span class="ln">  58</span>        <span class="k">if</span> <span class="k">not</span> (is_root <span class="k">or</span> is_inside):
+<span class="ln">  59</span>            <span class="k">raise</span> ValueError(f&quot;{relative_path!r} is outside the workspace and was refused.&quot;)
+<span class="ln">  60</span>        <span class="k">return</span> candidate
+<span class="ln">  61</span>
+<span class="ln">  62</span>    <span class="c"># ----- the five tools ---------------------------------------------------</span>
+<span class="ln">  63</span>
+<span class="ln">  64</span>    <span class="k">def</span> list_files(self, path: <span class="b">str</span> = <span class="s">&quot;.&quot;</span>) -&gt; <span class="b">str</span>:
+<span class="ln">  65</span>        <span class="d">&quot;&quot;&quot;List files and folders under `path` (recursive), one per line.&quot;&quot;&quot;</span>
+<span class="ln">  66</span>        start = self.safe_path(path)
+<span class="ln">  67</span>        <span class="k">if</span> <span class="k">not</span> os.path.isdir(start):
+<span class="ln">  68</span>            <span class="k">return</span> f&quot;Error: {path!r} is not a folder.&quot;
+<span class="ln">  69</span>        lines = []
+<span class="ln">  70</span>        <span class="k">for</span> folder, subfolders, files <span class="k">in</span> os.walk(start):
+<span class="ln">  71</span>            subfolders[:] = sorted(name <span class="k">for</span> name <span class="k">in</span> subfolders <span class="k">if</span> name <span class="k">not</span> <span class="k">in</span> SKIP_DIRS)
+<span class="ln">  72</span>            <span class="k">for</span> name <span class="k">in</span> sorted(files):
+<span class="ln">  73</span>                full = os.path.join(folder, name)
+<span class="ln">  74</span>                shown = os.path.relpath(full, self.root)
+<span class="ln">  75</span>                size = os.path.getsize(full)
+<span class="ln">  76</span>                lines.append(f&quot;{shown}  ({size} bytes)&quot;)
+<span class="ln">  77</span>                <span class="k">if</span> <span class="b">len</span>(lines) &gt;= MAX_LIST_ENTRIES:
+<span class="ln">  78</span>                    lines.append(f&quot;... stopped after {MAX_LIST_ENTRIES} entries&quot;)
+<span class="ln">  79</span>                    <span class="k">return</span> <span class="s">&quot;\n&quot;</span>.join(lines)
+<span class="ln">  80</span>        <span class="k">if</span> <span class="k">not</span> lines:
+<span class="ln">  81</span>            <span class="k">return</span> <span class="s">&quot;(the folder is empty)&quot;</span>
+<span class="ln">  82</span>        <span class="k">return</span> <span class="s">&quot;\n&quot;</span>.join(lines)
+<span class="ln">  83</span>
+<span class="ln">  84</span>    <span class="k">def</span> read_file(self, path: <span class="b">str</span>, start_line: <span class="b">int</span> = <span class="n">1</span>, max_lines: <span class="b">int</span> = <span class="n">400</span>) -&gt; <span class="b">str</span>:
+<span class="ln">  85</span>        <span class="d">&quot;&quot;&quot;Return the file&#x27;s text with line numbers, e.g. &#x27;  12| print(x)&#x27;.
+<span class="ln">  86</span>
+<span class="ln">  87</span>        Line numbers matter: they let the model quote exact lines back when
+<span class="ln">  88</span>        it edits, and let you check its claims against the real file.
+<span class="ln">  89</span>        &quot;&quot;&quot;</span>
+<span class="ln">  90</span>        full = self.safe_path(path)
+<span class="ln">  91</span>        <span class="k">if</span> <span class="k">not</span> os.path.isfile(full):
+<span class="ln">  92</span>            <span class="k">return</span> f&quot;Error: {path!r} does not exist.&quot;
+<span class="ln">  93</span>        <span class="k">with</span> <span class="b">open</span>(full, encoding=<span class="s">&quot;utf-8&quot;</span>, errors=<span class="s">&quot;replace&quot;</span>) <span class="k">as</span> file:
+<span class="ln">  94</span>            all_lines = file.read().splitlines()
+<span class="ln">  95</span>        first = max(start_line, <span class="n">1</span>)
+<span class="ln">  96</span>        last = min(first + max_lines - <span class="n">1</span>, <span class="b">len</span>(all_lines))
+<span class="ln">  97</span>        numbered = []
+<span class="ln">  98</span>        <span class="k">for</span> number <span class="k">in</span> <span class="b">range</span>(first, last + <span class="n">1</span>):
+<span class="ln">  99</span>            numbered.append(f&quot;{number:5d}| {all_lines[number - <span class="n">1</span>]}&quot;)
+<span class="ln"> 100</span>        header = f&quot;{path} (lines {first}-{last} of {<span class="b">len</span>(all_lines)})\n&quot;
+<span class="ln"> 101</span>        <span class="k">return</span> truncate_output(header + <span class="s">&quot;\n&quot;</span>.join(numbered))
+<span class="ln"> 102</span>
+<span class="ln"> 103</span>    <span class="k">def</span> write_file(self, path: <span class="b">str</span>, content: <span class="b">str</span>) -&gt; <span class="b">str</span>:
+<span class="ln"> 104</span>        <span class="d">&quot;&quot;&quot;Create or completely replace a file.&quot;&quot;&quot;</span>
+<span class="ln"> 105</span>        <span class="k">if</span> <span class="k">not</span> <span class="b">isinstance</span>(content, <span class="b">str</span>):
+<span class="ln"> 106</span>            <span class="k">return</span> <span class="s">&quot;Error: content must be text.&quot;</span>
+<span class="ln"> 107</span>        <span class="k">if</span> <span class="b">len</span>(content) &gt; MAX_WRITE_CHARS:
+<span class="ln"> 108</span>            <span class="k">return</span> f&quot;Error: content is {<span class="b">len</span>(content)} characters; the limit is {MAX_WRITE_CHARS}. Write the file in parts.&quot;
+<span class="ln"> 109</span>        full = self.safe_path(path)
+<span class="ln"> 110</span>        os.makedirs(os.path.dirname(full), exist_ok=<span class="k">True</span>)
 <span class="ln"> 111</span>        <span class="k">with</span> <span class="b">open</span>(full, <span class="s">&quot;w&quot;</span>, encoding=<span class="s">&quot;utf-8&quot;</span>) <span class="k">as</span> file:
-<span class="ln"> 112</span>            file.write(updated)
-<span class="ln"> 113</span>        <span class="k">return</span> f&quot;Edited {path}: replaced {<span class="b">len</span>(old_text)} characters with {<span class="b">len</span>(new_text)}.&quot;
+<span class="ln"> 112</span>            file.write(content)
+<span class="ln"> 113</span>        <span class="k">return</span> f&quot;Wrote {<span class="b">len</span>(content)} characters to {path}.&quot;
 <span class="ln"> 114</span>
-<span class="ln"> 115</span>    <span class="k">def</span> run_command(self, command: <span class="b">str</span>, timeout_seconds: <span class="b">int</span> = <span class="n">60</span>) -&gt; <span class="b">str</span>:
-<span class="ln"> 116</span>        <span class="d">&quot;&quot;&quot;Run a shell command inside the workspace and return its output.
+<span class="ln"> 115</span>    <span class="k">def</span> edit_file(self, path: <span class="b">str</span>, old_text: <span class="b">str</span>, new_text: <span class="b">str</span>) -&gt; <span class="b">str</span>:
+<span class="ln"> 116</span>        <span class="d">&quot;&quot;&quot;Replace ONE exact occurrence of old_text with new_text.
 <span class="ln"> 117</span>
-<span class="ln"> 118</span>        stdout and stderr are both captured, the exit code is reported, and a
-<span class="ln"> 119</span>        timeout stops runaway commands. The command runs with the same rights
-<span class="ln"> 120</span>        as you, so the folder lock is a convenience, not a security boundary.
+<span class="ln"> 118</span>        Exactness is the safety feature. If old_text is missing the model
+<span class="ln"> 119</span>        is told so; if it appears twice the model must include more context.
+<span class="ln"> 120</span>        Either way nothing is changed until the match is unambiguous.
 <span class="ln"> 121</span>        &quot;&quot;&quot;</span>
-<span class="ln"> 122</span>        <span class="k">try</span>:
-<span class="ln"> 123</span>            completed = subprocess.run(
-<span class="ln"> 124</span>                command,
-<span class="ln"> 125</span>                shell=<span class="k">True</span>,
-<span class="ln"> 126</span>                cwd=self.root,
-<span class="ln"> 127</span>                capture_output=<span class="k">True</span>,
-<span class="ln"> 128</span>                text=<span class="k">True</span>,
-<span class="ln"> 129</span>                timeout=timeout_seconds,
-<span class="ln"> 130</span>            )
-<span class="ln"> 131</span>        <span class="k">except</span> subprocess.TimeoutExpired:
-<span class="ln"> 132</span>            <span class="k">return</span> f&quot;Error: the command did not finish within {timeout_seconds} seconds and was killed.&quot;
-<span class="ln"> 133</span>        output = completed.stdout
-<span class="ln"> 134</span>        <span class="k">if</span> completed.stderr:
-<span class="ln"> 135</span>            output = output + (<span class="s">&quot;\n[stderr]\n&quot;</span> <span class="k">if</span> output <span class="k">else</span> <span class="s">&quot;[stderr]\n&quot;</span>) + completed.stderr
-<span class="ln"> 136</span>        <span class="k">if</span> output.strip() == <span class="s">&quot;&quot;</span>:
-<span class="ln"> 137</span>            output = <span class="s">&quot;(no output)&quot;</span>
-<span class="ln"> 138</span>        <span class="k">return</span> truncate_output(f&quot;exit code {completed.returncode}\n{output}&quot;)
+<span class="ln"> 122</span>        full = self.safe_path(path)
+<span class="ln"> 123</span>        <span class="k">if</span> <span class="k">not</span> os.path.isfile(full):
+<span class="ln"> 124</span>            <span class="k">return</span> f&quot;Error: {path!r} does not exist. Use write_file to create it.&quot;
+<span class="ln"> 125</span>        <span class="k">with</span> <span class="b">open</span>(full, encoding=<span class="s">&quot;utf-8&quot;</span>) <span class="k">as</span> file:
+<span class="ln"> 126</span>            original = file.read()
+<span class="ln"> 127</span>        occurrences = original.count(old_text)
+<span class="ln"> 128</span>        <span class="k">if</span> occurrences == <span class="n">0</span>:
+<span class="ln"> 129</span>            <span class="k">return</span> <span class="s">&quot;Error: old_text was not found in the file. Read the file and copy the text exactly.&quot;</span>
+<span class="ln"> 130</span>        <span class="k">if</span> occurrences &gt; <span class="n">1</span>:
+<span class="ln"> 131</span>            <span class="k">return</span> f&quot;Error: old_text appears {occurrences} times. Include more surrounding lines so it is unique.&quot;
+<span class="ln"> 132</span>        updated = original.replace(old_text, new_text, <span class="n">1</span>)
+<span class="ln"> 133</span>        <span class="k">with</span> <span class="b">open</span>(full, <span class="s">&quot;w&quot;</span>, encoding=<span class="s">&quot;utf-8&quot;</span>) <span class="k">as</span> file:
+<span class="ln"> 134</span>            file.write(updated)
+<span class="ln"> 135</span>        <span class="k">return</span> f&quot;Edited {path}: replaced {<span class="b">len</span>(old_text)} characters with {<span class="b">len</span>(new_text)}.&quot;
+<span class="ln"> 136</span>
+<span class="ln"> 137</span>    <span class="k">def</span> run_command(self, command: <span class="b">str</span>, timeout_seconds: <span class="b">int</span> = <span class="n">60</span>) -&gt; <span class="b">str</span>:
+<span class="ln"> 138</span>        <span class="d">&quot;&quot;&quot;Run a shell command with the workspace as its current directory.
 <span class="ln"> 139</span>
-<span class="ln"> 140</span>    <span class="c"># ----- project memory ----------------------------------------------------</span>
-<span class="ln"> 141</span>
-<span class="ln"> 142</span>    <span class="k">def</span> read_instructions(self) -&gt; <span class="b">str</span>:
-<span class="ln"> 143</span>        <span class="d">&quot;&quot;&quot;Return the text of AGENTS.md in the workspace, or &#x27;&#x27; if there is none.&quot;&quot;&quot;</span>
-<span class="ln"> 144</span>        path = os.path.join(self.root, <span class="s">&quot;AGENTS.md&quot;</span>)
-<span class="ln"> 145</span>        <span class="k">if</span> <span class="k">not</span> os.path.isfile(path):
-<span class="ln"> 146</span>            <span class="k">return</span> <span class="s">&quot;&quot;</span>
-<span class="ln"> 147</span>        <span class="k">with</span> <span class="b">open</span>(path, encoding=<span class="s">&quot;utf-8&quot;</span>) <span class="k">as</span> file:
-<span class="ln"> 148</span>            <span class="k">return</span> file.read().strip()
-<span class="ln"> 149</span>
-<span class="ln"> 150</span>
-<span class="ln"> 151</span><span class="k">def</span> truncate_output(text: <span class="b">str</span>, limit: <span class="b">int</span> = MAX_OUTPUT_CHARS) -&gt; <span class="b">str</span>:
-<span class="ln"> 152</span>    <span class="d">&quot;&quot;&quot;Keep the start and the end of a long text, and say how much was cut.&quot;&quot;&quot;</span>
-<span class="ln"> 153</span>    <span class="k">if</span> <span class="b">len</span>(text) &lt;= limit:
-<span class="ln"> 154</span>        <span class="k">return</span> text
-<span class="ln"> 155</span>    keep = limit // <span class="n">2</span>
-<span class="ln"> 156</span>    cut = <span class="b">len</span>(text) - limit
-<span class="ln"> 157</span>    <span class="k">return</span> text[:keep] + f&quot;\n... [{cut} characters cut out of the middle] ...\n&quot; + text[-keep:]
-<span class="ln"> 158</span>
-<span class="ln"> 159</span>
-<span class="ln"> 160</span><span class="k">def</span> build_tools(workspace: Workspace) -&gt; <span class="b">list</span>[Tool]:
-<span class="ln"> 161</span>    <span class="d">&quot;&quot;&quot;Describe the five workspace methods so the model can call them.
-<span class="ln"> 162</span>
-<span class="ln"> 163</span>    This is the menu. The description is the ONLY thing the model reads to
-<span class="ln"> 164</span>    decide when to use a tool, so it is written for the model, not for you.
-<span class="ln"> 165</span>    &quot;&quot;&quot;</span>
-<span class="ln"> 166</span>    <span class="k">return</span> [
-<span class="ln"> 167</span>        Tool(
-<span class="ln"> 168</span>            name=<span class="s">&quot;list_files&quot;</span>,
-<span class="ln"> 169</span>            description=<span class="s">&quot;List every file under a folder in the workspace, with sizes. Start here.&quot;</span>,
-<span class="ln"> 170</span>            parameters={
-<span class="ln"> 171</span>                <span class="s">&quot;type&quot;</span>: <span class="s">&quot;object&quot;</span>,
-<span class="ln"> 172</span>                <span class="s">&quot;properties&quot;</span>: {
-<span class="ln"> 173</span>                    <span class="s">&quot;path&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;Folder to list, relative to the workspace. Default &#x27;.&#x27;&quot;</span>},
-<span class="ln"> 174</span>                },
-<span class="ln"> 175</span>                <span class="s">&quot;required&quot;</span>: [],
-<span class="ln"> 176</span>            },
-<span class="ln"> 177</span>            function=workspace.list_files,
-<span class="ln"> 178</span>        ),
-<span class="ln"> 179</span>        Tool(
-<span class="ln"> 180</span>            name=<span class="s">&quot;read_file&quot;</span>,
-<span class="ln"> 181</span>            description=<span class="s">&quot;Read a text file with line numbers. Use start_line and max_lines for long files.&quot;</span>,
-<span class="ln"> 182</span>            parameters={
-<span class="ln"> 183</span>                <span class="s">&quot;type&quot;</span>: <span class="s">&quot;object&quot;</span>,
-<span class="ln"> 184</span>                <span class="s">&quot;properties&quot;</span>: {
-<span class="ln"> 185</span>                    <span class="s">&quot;path&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;File path relative to the workspace.&quot;</span>},
-<span class="ln"> 186</span>                    <span class="s">&quot;start_line&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;integer&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;First line to show (1-based). Default 1.&quot;</span>},
-<span class="ln"> 187</span>                    <span class="s">&quot;max_lines&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;integer&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;How many lines to show. Default 400.&quot;</span>},
-<span class="ln"> 188</span>                },
-<span class="ln"> 189</span>                <span class="s">&quot;required&quot;</span>: [<span class="s">&quot;path&quot;</span>],
-<span class="ln"> 190</span>            },
-<span class="ln"> 191</span>            function=workspace.read_file,
-<span class="ln"> 192</span>        ),
-<span class="ln"> 193</span>        Tool(
-<span class="ln"> 194</span>            name=<span class="s">&quot;write_file&quot;</span>,
-<span class="ln"> 195</span>            description=<span class="s">&quot;Create a new file or completely replace an existing one with the given content.&quot;</span>,
-<span class="ln"> 196</span>            parameters={
-<span class="ln"> 197</span>                <span class="s">&quot;type&quot;</span>: <span class="s">&quot;object&quot;</span>,
-<span class="ln"> 198</span>                <span class="s">&quot;properties&quot;</span>: {
-<span class="ln"> 199</span>                    <span class="s">&quot;path&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;File path relative to the workspace.&quot;</span>},
-<span class="ln"> 200</span>                    <span class="s">&quot;content&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;The full text the file should contain.&quot;</span>},
-<span class="ln"> 201</span>                },
-<span class="ln"> 202</span>                <span class="s">&quot;required&quot;</span>: [<span class="s">&quot;path&quot;</span>, <span class="s">&quot;content&quot;</span>],
-<span class="ln"> 203</span>            },
-<span class="ln"> 204</span>            function=workspace.write_file,
-<span class="ln"> 205</span>        ),
-<span class="ln"> 206</span>        Tool(
-<span class="ln"> 207</span>            name=<span class="s">&quot;edit_file&quot;</span>,
-<span class="ln"> 208</span>            description=(
-<span class="ln"> 209</span>                <span class="s">&quot;Replace one exact occurrence of old_text with new_text in a file. &quot;</span>
-<span class="ln"> 210</span>                <span class="s">&quot;old_text must match the file exactly (whitespace included) and appear only once.&quot;</span>
-<span class="ln"> 211</span>            ),
-<span class="ln"> 212</span>            parameters={
-<span class="ln"> 213</span>                <span class="s">&quot;type&quot;</span>: <span class="s">&quot;object&quot;</span>,
-<span class="ln"> 214</span>                <span class="s">&quot;properties&quot;</span>: {
-<span class="ln"> 215</span>                    <span class="s">&quot;path&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;File path relative to the workspace.&quot;</span>},
-<span class="ln"> 216</span>                    <span class="s">&quot;old_text&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;The exact text to find.&quot;</span>},
-<span class="ln"> 217</span>                    <span class="s">&quot;new_text&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;The text to put in its place.&quot;</span>},
-<span class="ln"> 218</span>                },
-<span class="ln"> 219</span>                <span class="s">&quot;required&quot;</span>: [<span class="s">&quot;path&quot;</span>, <span class="s">&quot;old_text&quot;</span>, <span class="s">&quot;new_text&quot;</span>],
-<span class="ln"> 220</span>            },
-<span class="ln"> 221</span>            function=workspace.edit_file,
-<span class="ln"> 222</span>        ),
-<span class="ln"> 223</span>        Tool(
-<span class="ln"> 224</span>            name=<span class="s">&quot;run_command&quot;</span>,
-<span class="ln"> 225</span>            description=(
-<span class="ln"> 226</span>                <span class="s">&quot;Run a shell command inside the workspace (for example &#x27;python3 app.py&#x27; or &#x27;ls -la&#x27;) &quot;</span>
-<span class="ln"> 227</span>                <span class="s">&quot;and return its output and exit code.&quot;</span>
-<span class="ln"> 228</span>            ),
-<span class="ln"> 229</span>            parameters={
-<span class="ln"> 230</span>                <span class="s">&quot;type&quot;</span>: <span class="s">&quot;object&quot;</span>,
-<span class="ln"> 231</span>                <span class="s">&quot;properties&quot;</span>: {
-<span class="ln"> 232</span>                    <span class="s">&quot;command&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;The command line to run.&quot;</span>},
-<span class="ln"> 233</span>                    <span class="s">&quot;timeout_seconds&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;integer&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;Kill it after this many seconds. Default 60.&quot;</span>},
-<span class="ln"> 234</span>                },
-<span class="ln"> 235</span>                <span class="s">&quot;required&quot;</span>: [<span class="s">&quot;command&quot;</span>],
-<span class="ln"> 236</span>            },
-<span class="ln"> 237</span>            function=workspace.run_command,
-<span class="ln"> 238</span>        ),
-<span class="ln"> 239</span>    ]</code></pre></figure></details>
+<span class="ln"> 140</span>        Output and exit code come back as text. Three guards, all visible:
+<span class="ln"> 141</span>          - the command sees a MINIMAL environment (see minimal_environment),
+<span class="ln"> 142</span>            so it cannot read the model API key;
+<span class="ln"> 143</span>          - the timeout is clamped to MAX_COMMAND_SECONDS, and on timeout the
+<span class="ln"> 144</span>            whole process group is killed, not just the shell;
+<span class="ln"> 145</span>          - output is captured to temporary files and only the first
+<span class="ln"> 146</span>            MAX_CAPTURE_BYTES are read back, so a runaway command cannot
+<span class="ln"> 147</span>            fill memory.
+<span class="ln"> 148</span>        None of this stops the shell from leaving the folder. See the note
+<span class="ln"> 149</span>        at the top of this file.
+<span class="ln"> 150</span>        &quot;&quot;&quot;</span>
+<span class="ln"> 151</span>        <span class="k">if</span> <span class="k">not</span> <span class="b">isinstance</span>(command, <span class="b">str</span>) <span class="k">or</span> command.strip() == <span class="s">&quot;&quot;</span>:
+<span class="ln"> 152</span>            <span class="k">return</span> <span class="s">&quot;Error: command must be a non-empty string.&quot;</span>
+<span class="ln"> 153</span>        timeout_seconds = clamp_timeout(timeout_seconds)
+<span class="ln"> 154</span>
+<span class="ln"> 155</span>        <span class="k">with</span> tempfile.TemporaryFile() <span class="k">as</span> stdout_file, tempfile.TemporaryFile() <span class="k">as</span> stderr_file:
+<span class="ln"> 156</span>            process = subprocess.Popen(
+<span class="ln"> 157</span>                command,
+<span class="ln"> 158</span>                shell=<span class="k">True</span>,
+<span class="ln"> 159</span>                cwd=self.root,
+<span class="ln"> 160</span>                stdout=stdout_file,
+<span class="ln"> 161</span>                stderr=stderr_file,
+<span class="ln"> 162</span>                env=minimal_environment(self.root),
+<span class="ln"> 163</span>                start_new_session=<span class="k">True</span>,   <span class="c"># the shell becomes a group leader, so we can kill the whole group</span>
+<span class="ln"> 164</span>            )
+<span class="ln"> 165</span>            timed_out = <span class="k">False</span>
+<span class="ln"> 166</span>            <span class="k">try</span>:
+<span class="ln"> 167</span>                process.wait(timeout=timeout_seconds)
+<span class="ln"> 168</span>            <span class="k">except</span> subprocess.TimeoutExpired:
+<span class="ln"> 169</span>                timed_out = <span class="k">True</span>
+<span class="ln"> 170</span>                os.killpg(process.pid, signal.SIGKILL)
+<span class="ln"> 171</span>                process.wait()
+<span class="ln"> 172</span>            stdout = read_captured(stdout_file)
+<span class="ln"> 173</span>            stderr = read_captured(stderr_file)
+<span class="ln"> 174</span>
+<span class="ln"> 175</span>        output = stdout
+<span class="ln"> 176</span>        <span class="k">if</span> stderr:
+<span class="ln"> 177</span>            output = output + (<span class="s">&quot;\n[stderr]\n&quot;</span> <span class="k">if</span> output <span class="k">else</span> <span class="s">&quot;[stderr]\n&quot;</span>) + stderr
+<span class="ln"> 178</span>        <span class="k">if</span> output.strip() == <span class="s">&quot;&quot;</span>:
+<span class="ln"> 179</span>            output = <span class="s">&quot;(no output)&quot;</span>
+<span class="ln"> 180</span>        <span class="k">if</span> timed_out:
+<span class="ln"> 181</span>            <span class="k">return</span> truncate_output(
+<span class="ln"> 182</span>                f&quot;Error: the command did not finish within {timeout_seconds} seconds and was killed.\n&quot;
+<span class="ln"> 183</span>                f&quot;Output before the kill:\n{output}&quot;
+<span class="ln"> 184</span>            )
+<span class="ln"> 185</span>        <span class="k">return</span> truncate_output(f&quot;exit code {process.returncode}\n{output}&quot;)
+<span class="ln"> 186</span>
+<span class="ln"> 187</span>    <span class="c"># ----- project memory ----------------------------------------------------</span>
+<span class="ln"> 188</span>
+<span class="ln"> 189</span>    <span class="k">def</span> read_instructions(self) -&gt; <span class="b">str</span>:
+<span class="ln"> 190</span>        <span class="d">&quot;&quot;&quot;Return the text of AGENTS.md in the workspace, or &#x27;&#x27; if there is none.
+<span class="ln"> 191</span>
+<span class="ln"> 192</span>        Goes through safe_path like every other read, so a symlink named
+<span class="ln"> 193</span>        AGENTS.md that points outside the workspace is ignored, and the
+<span class="ln"> 194</span>        text is capped so a huge file cannot swamp the system prompt.
+<span class="ln"> 195</span>        &quot;&quot;&quot;</span>
+<span class="ln"> 196</span>        <span class="k">try</span>:
+<span class="ln"> 197</span>            path = self.safe_path(<span class="s">&quot;AGENTS.md&quot;</span>)
+<span class="ln"> 198</span>        <span class="k">except</span> ValueError:
+<span class="ln"> 199</span>            <span class="k">return</span> <span class="s">&quot;&quot;</span>
+<span class="ln"> 200</span>        <span class="k">if</span> <span class="k">not</span> os.path.isfile(path):
+<span class="ln"> 201</span>            <span class="k">return</span> <span class="s">&quot;&quot;</span>
+<span class="ln"> 202</span>        <span class="k">with</span> <span class="b">open</span>(path, encoding=<span class="s">&quot;utf-8&quot;</span>, errors=<span class="s">&quot;replace&quot;</span>) <span class="k">as</span> file:
+<span class="ln"> 203</span>            text = file.read(MAX_INSTRUCTIONS_CHARS + <span class="n">1</span>)
+<span class="ln"> 204</span>        <span class="k">if</span> <span class="b">len</span>(text) &gt; MAX_INSTRUCTIONS_CHARS:
+<span class="ln"> 205</span>            text = text[:MAX_INSTRUCTIONS_CHARS] + <span class="s">&quot;\n[AGENTS.md was cut here: keep it short]&quot;</span>
+<span class="ln"> 206</span>        <span class="k">return</span> text.strip()
+<span class="ln"> 207</span>
+<span class="ln"> 208</span>
+<span class="ln"> 209</span><span class="k">def</span> clamp_timeout(value) -&gt; <span class="b">int</span>:
+<span class="ln"> 210</span>    <span class="d">&quot;&quot;&quot;Turn whatever the model sent into a whole number of seconds within limits.&quot;&quot;&quot;</span>
+<span class="ln"> 211</span>    <span class="k">try</span>:
+<span class="ln"> 212</span>        seconds = <span class="b">int</span>(value)
+<span class="ln"> 213</span>    <span class="k">except</span> (TypeError, ValueError):
+<span class="ln"> 214</span>        seconds = <span class="n">60</span>
+<span class="ln"> 215</span>    <span class="k">return</span> max(<span class="n">1</span>, min(seconds, MAX_COMMAND_SECONDS))
+<span class="ln"> 216</span>
+<span class="ln"> 217</span>
+<span class="ln"> 218</span><span class="k">def</span> minimal_environment(home: <span class="b">str</span>) -&gt; <span class="b">dict</span>:
+<span class="ln"> 219</span>    <span class="d">&quot;&quot;&quot;The only environment variables a command gets.
+<span class="ln"> 220</span>
+<span class="ln"> 221</span>    Notably absent: LLM_API_KEY and everything else from .env. A command the
+<span class="ln"> 222</span>    model wrote must never be able to print the key. HOME points at the
+<span class="ln"> 223</span>    workspace so tools that write config files stay inside it by default.
+<span class="ln"> 224</span>    &quot;&quot;&quot;</span>
+<span class="ln"> 225</span>    <span class="k">return</span> {
+<span class="ln"> 226</span>        <span class="s">&quot;PATH&quot;</span>: os.environ.get(<span class="s">&quot;PATH&quot;</span>, <span class="s">&quot;/usr/local/bin:/usr/bin:/bin&quot;</span>),
+<span class="ln"> 227</span>        <span class="s">&quot;HOME&quot;</span>: home,
+<span class="ln"> 228</span>        <span class="s">&quot;LANG&quot;</span>: <span class="s">&quot;C.UTF-8&quot;</span>,
+<span class="ln"> 229</span>        <span class="s">&quot;TERM&quot;</span>: <span class="s">&quot;dumb&quot;</span>,
+<span class="ln"> 230</span>        <span class="s">&quot;PYTHONUNBUFFERED&quot;</span>: <span class="s">&quot;1&quot;</span>,
+<span class="ln"> 231</span>        <span class="s">&quot;PYTHONDONTWRITEBYTECODE&quot;</span>: <span class="s">&quot;1&quot;</span>,
+<span class="ln"> 232</span>    }
+<span class="ln"> 233</span>
+<span class="ln"> 234</span>
+<span class="ln"> 235</span><span class="k">def</span> read_captured(file) -&gt; <span class="b">str</span>:
+<span class="ln"> 236</span>    <span class="d">&quot;&quot;&quot;Read at most MAX_CAPTURE_BYTES from a temporary output file.&quot;&quot;&quot;</span>
+<span class="ln"> 237</span>    file.seek(<span class="n">0</span>)
+<span class="ln"> 238</span>    data = file.read(MAX_CAPTURE_BYTES + <span class="n">1</span>)
+<span class="ln"> 239</span>    text = data[:MAX_CAPTURE_BYTES].decode(<span class="s">&quot;utf-8&quot;</span>, errors=<span class="s">&quot;replace&quot;</span>)
+<span class="ln"> 240</span>    <span class="k">if</span> <span class="b">len</span>(data) &gt; MAX_CAPTURE_BYTES:
+<span class="ln"> 241</span>        text += f&quot;\n... [output beyond {MAX_CAPTURE_BYTES} bytes was not captured] ...&quot;
+<span class="ln"> 242</span>    <span class="k">return</span> text
+<span class="ln"> 243</span>
+<span class="ln"> 244</span>
+<span class="ln"> 245</span><span class="k">def</span> truncate_output(text: <span class="b">str</span>, limit: <span class="b">int</span> = MAX_OUTPUT_CHARS) -&gt; <span class="b">str</span>:
+<span class="ln"> 246</span>    <span class="d">&quot;&quot;&quot;Keep the start and the end of a long text, and say how much was cut.&quot;&quot;&quot;</span>
+<span class="ln"> 247</span>    <span class="k">if</span> <span class="b">len</span>(text) &lt;= limit:
+<span class="ln"> 248</span>        <span class="k">return</span> text
+<span class="ln"> 249</span>    keep = limit // <span class="n">2</span>
+<span class="ln"> 250</span>    cut = <span class="b">len</span>(text) - limit
+<span class="ln"> 251</span>    <span class="k">return</span> text[:keep] + f&quot;\n... [{cut} characters cut out of the middle] ...\n&quot; + text[-keep:]
+<span class="ln"> 252</span>
+<span class="ln"> 253</span>
+<span class="ln"> 254</span><span class="k">def</span> build_tools(workspace: Workspace) -&gt; <span class="b">list</span>[Tool]:
+<span class="ln"> 255</span>    <span class="d">&quot;&quot;&quot;Describe the five workspace methods so the model can call them.
+<span class="ln"> 256</span>
+<span class="ln"> 257</span>    This is the menu. The description is the ONLY thing the model reads to
+<span class="ln"> 258</span>    decide when to use a tool, so it is written for the model, not for you.
+<span class="ln"> 259</span>    &quot;&quot;&quot;</span>
+<span class="ln"> 260</span>    <span class="k">return</span> [
+<span class="ln"> 261</span>        Tool(
+<span class="ln"> 262</span>            name=<span class="s">&quot;list_files&quot;</span>,
+<span class="ln"> 263</span>            description=<span class="s">&quot;List every file under a folder in the workspace, with sizes. Start here.&quot;</span>,
+<span class="ln"> 264</span>            parameters={
+<span class="ln"> 265</span>                <span class="s">&quot;type&quot;</span>: <span class="s">&quot;object&quot;</span>,
+<span class="ln"> 266</span>                <span class="s">&quot;properties&quot;</span>: {
+<span class="ln"> 267</span>                    <span class="s">&quot;path&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;Folder to list, relative to the workspace. Default &#x27;.&#x27;&quot;</span>},
+<span class="ln"> 268</span>                },
+<span class="ln"> 269</span>                <span class="s">&quot;required&quot;</span>: [],
+<span class="ln"> 270</span>            },
+<span class="ln"> 271</span>            function=workspace.list_files,
+<span class="ln"> 272</span>        ),
+<span class="ln"> 273</span>        Tool(
+<span class="ln"> 274</span>            name=<span class="s">&quot;read_file&quot;</span>,
+<span class="ln"> 275</span>            description=<span class="s">&quot;Read a text file with line numbers. Use start_line and max_lines for long files.&quot;</span>,
+<span class="ln"> 276</span>            parameters={
+<span class="ln"> 277</span>                <span class="s">&quot;type&quot;</span>: <span class="s">&quot;object&quot;</span>,
+<span class="ln"> 278</span>                <span class="s">&quot;properties&quot;</span>: {
+<span class="ln"> 279</span>                    <span class="s">&quot;path&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;File path relative to the workspace.&quot;</span>},
+<span class="ln"> 280</span>                    <span class="s">&quot;start_line&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;integer&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;First line to show (1-based). Default 1.&quot;</span>},
+<span class="ln"> 281</span>                    <span class="s">&quot;max_lines&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;integer&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;How many lines to show. Default 400.&quot;</span>},
+<span class="ln"> 282</span>                },
+<span class="ln"> 283</span>                <span class="s">&quot;required&quot;</span>: [<span class="s">&quot;path&quot;</span>],
+<span class="ln"> 284</span>            },
+<span class="ln"> 285</span>            function=workspace.read_file,
+<span class="ln"> 286</span>        ),
+<span class="ln"> 287</span>        Tool(
+<span class="ln"> 288</span>            name=<span class="s">&quot;write_file&quot;</span>,
+<span class="ln"> 289</span>            description=<span class="s">&quot;Create a new file or completely replace an existing one with the given content.&quot;</span>,
+<span class="ln"> 290</span>            parameters={
+<span class="ln"> 291</span>                <span class="s">&quot;type&quot;</span>: <span class="s">&quot;object&quot;</span>,
+<span class="ln"> 292</span>                <span class="s">&quot;properties&quot;</span>: {
+<span class="ln"> 293</span>                    <span class="s">&quot;path&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;File path relative to the workspace.&quot;</span>},
+<span class="ln"> 294</span>                    <span class="s">&quot;content&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;The full text the file should contain.&quot;</span>},
+<span class="ln"> 295</span>                },
+<span class="ln"> 296</span>                <span class="s">&quot;required&quot;</span>: [<span class="s">&quot;path&quot;</span>, <span class="s">&quot;content&quot;</span>],
+<span class="ln"> 297</span>            },
+<span class="ln"> 298</span>            function=workspace.write_file,
+<span class="ln"> 299</span>        ),
+<span class="ln"> 300</span>        Tool(
+<span class="ln"> 301</span>            name=<span class="s">&quot;edit_file&quot;</span>,
+<span class="ln"> 302</span>            description=(
+<span class="ln"> 303</span>                <span class="s">&quot;Replace one exact occurrence of old_text with new_text in a file. &quot;</span>
+<span class="ln"> 304</span>                <span class="s">&quot;old_text must match the file exactly (whitespace included) and appear only once.&quot;</span>
+<span class="ln"> 305</span>            ),
+<span class="ln"> 306</span>            parameters={
+<span class="ln"> 307</span>                <span class="s">&quot;type&quot;</span>: <span class="s">&quot;object&quot;</span>,
+<span class="ln"> 308</span>                <span class="s">&quot;properties&quot;</span>: {
+<span class="ln"> 309</span>                    <span class="s">&quot;path&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;File path relative to the workspace.&quot;</span>},
+<span class="ln"> 310</span>                    <span class="s">&quot;old_text&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;The exact text to find.&quot;</span>},
+<span class="ln"> 311</span>                    <span class="s">&quot;new_text&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;The text to put in its place.&quot;</span>},
+<span class="ln"> 312</span>                },
+<span class="ln"> 313</span>                <span class="s">&quot;required&quot;</span>: [<span class="s">&quot;path&quot;</span>, <span class="s">&quot;old_text&quot;</span>, <span class="s">&quot;new_text&quot;</span>],
+<span class="ln"> 314</span>            },
+<span class="ln"> 315</span>            function=workspace.edit_file,
+<span class="ln"> 316</span>        ),
+<span class="ln"> 317</span>        Tool(
+<span class="ln"> 318</span>            name=<span class="s">&quot;run_command&quot;</span>,
+<span class="ln"> 319</span>            description=(
+<span class="ln"> 320</span>                <span class="s">&quot;Run a shell command with the workspace as the current directory (for example &quot;</span>
+<span class="ln"> 321</span>                <span class="s">&quot;&#x27;python3 app.py&#x27; or &#x27;ls -la&#x27;) and return its output and exit code. Commands are &quot;</span>
+<span class="ln"> 322</span>                f&quot;killed after timeout_seconds (maximum {MAX_COMMAND_SECONDS}).&quot;
+<span class="ln"> 323</span>            ),
+<span class="ln"> 324</span>            parameters={
+<span class="ln"> 325</span>                <span class="s">&quot;type&quot;</span>: <span class="s">&quot;object&quot;</span>,
+<span class="ln"> 326</span>                <span class="s">&quot;properties&quot;</span>: {
+<span class="ln"> 327</span>                    <span class="s">&quot;command&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;string&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;The command line to run.&quot;</span>},
+<span class="ln"> 328</span>                    <span class="s">&quot;timeout_seconds&quot;</span>: {<span class="s">&quot;type&quot;</span>: <span class="s">&quot;integer&quot;</span>, <span class="s">&quot;description&quot;</span>: <span class="s">&quot;Kill it after this many seconds. Default 60.&quot;</span>},
+<span class="ln"> 329</span>                },
+<span class="ln"> 330</span>                <span class="s">&quot;required&quot;</span>: [<span class="s">&quot;command&quot;</span>],
+<span class="ln"> 331</span>            },
+<span class="ln"> 332</span>            function=workspace.run_command,
+<span class="ln"> 333</span>        ),
+<span class="ln"> 334</span>    ]</code></pre></figure></details>
 <details><summary>The model call with readable errors: agent/llm.py</summary><figure class="code"><figcaption><span class="path">agent/llm.py</span><span class="hint">real file, embedded at build time</span></figcaption><pre><code><span class="ln">   1</span><span class="d">&quot;&quot;&quot;
 <span class="ln">   2</span>llm.py - the one place that talks to the model.
 <span class="ln">   3</span>
 <span class="ln">   4</span>Everything the agent learns from the model passes through chat(). It sends
 <span class="ln">   5</span>the message list (and the tool menu) to an OpenAI-compatible endpoint and
-<span class="ln">   6</span>returns the assistant&#x27;s reply exactly as it arrived. No SDK: plain HTTP with
-<span class="ln">   7</span>the standard library, so every byte that leaves and arrives is visible.
+<span class="ln">   6</span>returns the assistant&#x27;s reply. No SDK: plain HTTP with the standard
+<span class="ln">   7</span>library, so every byte that leaves and arrives is visible.
 <span class="ln">   8</span>
 <span class="ln">   9</span>The request, as JSON:
 <span class="ln">  10</span>    {&quot;model&quot;: &quot;...&quot;, &quot;messages&quot;: [...], &quot;tools&quot;: [...]}
@@ -1490,117 +1644,185 @@ python3 -m agent.server                       # chat in the browser at http://12
 <span class="ln">  13</span>    {&quot;choices&quot;: [{&quot;message&quot;: {&quot;role&quot;: &quot;assistant&quot;,
 <span class="ln">  14</span>                              &quot;content&quot;: &quot;text or null&quot;,
 <span class="ln">  15</span>                              &quot;tool_calls&quot;: [...]},      # only when it wants a tool
-<span class="ln">  16</span>                  &quot;finish_reason&quot;: &quot;stop&quot; | &quot;tool_calls&quot;}],
+<span class="ln">  16</span>                  &quot;finish_reason&quot;: &quot;stop&quot; | &quot;tool_calls&quot; | &quot;length&quot;}],
 <span class="ln">  17</span>     &quot;usage&quot;: {&quot;prompt_tokens&quot;: N, &quot;completion_tokens&quot;: N, &quot;total_tokens&quot;: N}}
-<span class="ln">  18</span>&quot;&quot;&quot;</span>
-<span class="ln">  19</span>
-<span class="ln">  20</span><span class="k">import</span> <span class="b">json</span>
-<span class="ln">  21</span><span class="k">import</span> urllib.error
-<span class="ln">  22</span><span class="k">import</span> urllib.request
-<span class="ln">  23</span><span class="k">from</span> dataclasses <span class="k">import</span> dataclass, field
-<span class="ln">  24</span>
-<span class="ln">  25</span><span class="k">from</span> .config <span class="k">import</span> Settings
-<span class="ln">  26</span>
-<span class="ln">  27</span>
-<span class="ln">  28</span><span class="k">class</span> LLMError(Exception):
-<span class="ln">  29</span>    <span class="d">&quot;&quot;&quot;The model call failed. The message is written for a human to act on.&quot;&quot;&quot;</span>
+<span class="ln">  18</span>
+<span class="ln">  19</span>Trust nothing in the reply until it has been checked. parse_reply() turns
+<span class="ln">  20</span>any malformed reply into an LLMError with a sentence a human can act on,
+<span class="ln">  21</span>so the loop only ever sees a well-formed ModelReply or a clean failure.
+<span class="ln">  22</span>&quot;&quot;&quot;</span>
+<span class="ln">  23</span>
+<span class="ln">  24</span><span class="k">import</span> <span class="b">json</span>
+<span class="ln">  25</span><span class="k">import</span> urllib.error
+<span class="ln">  26</span><span class="k">import</span> urllib.request
+<span class="ln">  27</span><span class="k">from</span> dataclasses <span class="k">import</span> dataclass, field
+<span class="ln">  28</span>
+<span class="ln">  29</span><span class="k">from</span> .config <span class="k">import</span> Settings
 <span class="ln">  30</span>
 <span class="ln">  31</span>
-<span class="ln">  32</span>@dataclass
-<span class="ln">  33</span><span class="k">class</span> ModelReply:
-<span class="ln">  34</span>    <span class="d">&quot;&quot;&quot;What chat() hands back: the message to append, plus bookkeeping.&quot;&quot;&quot;</span>
+<span class="ln">  32</span><span class="k">class</span> LLMError(Exception):
+<span class="ln">  33</span>    <span class="d">&quot;&quot;&quot;The model call failed. The message is written for a human to act on.&quot;&quot;&quot;</span>
+<span class="ln">  34</span>
 <span class="ln">  35</span>
-<span class="ln">  36</span>    message: <span class="b">dict</span>
-<span class="ln">  37</span>    finish_reason: <span class="b">str</span> = <span class="s">&quot;&quot;</span>
-<span class="ln">  38</span>    usage: <span class="b">dict</span> = field(default_factory=<span class="b">dict</span>)
+<span class="ln">  36</span>@dataclass
+<span class="ln">  37</span><span class="k">class</span> ModelReply:
+<span class="ln">  38</span>    <span class="d">&quot;&quot;&quot;What chat() hands back: the message to append, plus bookkeeping.&quot;&quot;&quot;</span>
 <span class="ln">  39</span>
-<span class="ln">  40</span>
-<span class="ln">  41</span><span class="k">def</span> chat(messages: <span class="b">list</span>[<span class="b">dict</span>], tools: <span class="b">list</span>[<span class="b">dict</span>], settings: Settings) -&gt; ModelReply:
-<span class="ln">  42</span>    <span class="d">&quot;&quot;&quot;One round trip: messages in, the assistant&#x27;s next message out.&quot;&quot;&quot;</span>
-<span class="ln">  43</span>    <span class="k">if</span> settings.api_key == <span class="s">&quot;&quot;</span>:
-<span class="ln">  44</span>        <span class="k">raise</span> LLMError(<span class="s">&quot;No API key. Copy .env.example to .env and set LLM_API_KEY.&quot;</span>)
-<span class="ln">  45</span>
-<span class="ln">  46</span>    payload = {<span class="s">&quot;model&quot;</span>: settings.model, <span class="s">&quot;messages&quot;</span>: messages}
-<span class="ln">  47</span>    <span class="k">if</span> tools:
-<span class="ln">  48</span>        payload[<span class="s">&quot;tools&quot;</span>] = tools
+<span class="ln">  40</span>    message: <span class="b">dict</span>
+<span class="ln">  41</span>    finish_reason: <span class="b">str</span> = <span class="s">&quot;&quot;</span>
+<span class="ln">  42</span>    usage: <span class="b">dict</span> = field(default_factory=<span class="b">dict</span>)
+<span class="ln">  43</span>
+<span class="ln">  44</span>
+<span class="ln">  45</span><span class="k">def</span> chat(messages: <span class="b">list</span>[<span class="b">dict</span>], tools: <span class="b">list</span>[<span class="b">dict</span>], settings: Settings) -&gt; ModelReply:
+<span class="ln">  46</span>    <span class="d">&quot;&quot;&quot;One round trip: messages in, the assistant&#x27;s next message out.&quot;&quot;&quot;</span>
+<span class="ln">  47</span>    <span class="k">if</span> settings.api_key == <span class="s">&quot;&quot;</span>:
+<span class="ln">  48</span>        <span class="k">raise</span> LLMError(<span class="s">&quot;No API key. Copy .env.example to .env and set LLM_API_KEY.&quot;</span>)
 <span class="ln">  49</span>
-<span class="ln">  50</span>    request = urllib.request.Request(
-<span class="ln">  51</span>        url=settings.base_url.rstrip(<span class="s">&quot;/&quot;</span>) + <span class="s">&quot;/chat/completions&quot;</span>,
-<span class="ln">  52</span>        data=<span class="b">json</span>.dumps(payload).encode(<span class="s">&quot;utf-8&quot;</span>),
-<span class="ln">  53</span>        method=<span class="s">&quot;POST&quot;</span>,
-<span class="ln">  54</span>        headers={
-<span class="ln">  55</span>            <span class="s">&quot;Authorization&quot;</span>: <span class="s">&quot;Bearer &quot;</span> + settings.api_key,
-<span class="ln">  56</span>            <span class="s">&quot;Content-Type&quot;</span>: <span class="s">&quot;application/json&quot;</span>,
-<span class="ln">  57</span>            <span class="c"># OpenRouter shows these two on its dashboard; other providers ignore them.</span>
-<span class="ln">  58</span>            <span class="s">&quot;HTTP-Referer&quot;</span>: <span class="s">&quot;https://github.com/somachak/coding-agent-blueprint&quot;</span>,
-<span class="ln">  59</span>            <span class="s">&quot;X-Title&quot;</span>: <span class="s">&quot;coding-agent-blueprint&quot;</span>,
-<span class="ln">  60</span>        },
-<span class="ln">  61</span>    )
-<span class="ln">  62</span>
-<span class="ln">  63</span>    <span class="k">try</span>:
-<span class="ln">  64</span>        <span class="k">with</span> urllib.request.urlopen(request, timeout=settings.timeout_seconds) <span class="k">as</span> response:
-<span class="ln">  65</span>            reply = <span class="b">json</span>.loads(response.read().decode(<span class="s">&quot;utf-8&quot;</span>))
-<span class="ln">  66</span>    <span class="k">except</span> urllib.error.HTTPError <span class="k">as</span> error:
-<span class="ln">  67</span>        <span class="k">raise</span> LLMError(explain_http_error(error)) <span class="k">from</span> error
-<span class="ln">  68</span>    <span class="k">except</span> urllib.error.URLError <span class="k">as</span> error:
-<span class="ln">  69</span>        <span class="k">raise</span> LLMError(f&quot;Could not reach {settings.base_url}: {error.reason}&quot;) <span class="k">from</span> error
-<span class="ln">  70</span>    <span class="k">except</span> TimeoutError <span class="k">as</span> error:
-<span class="ln">  71</span>        <span class="k">raise</span> LLMError(f&quot;The model did not answer within {settings.timeout_seconds}s.&quot;) <span class="k">from</span> error
-<span class="ln">  72</span>
-<span class="ln">  73</span>    <span class="c"># Some providers return HTTP 200 with an error object inside the body.</span>
-<span class="ln">  74</span>    <span class="k">if</span> <span class="s">&quot;choices&quot;</span> <span class="k">not</span> <span class="k">in</span> reply <span class="k">or</span> <span class="b">len</span>(reply[<span class="s">&quot;choices&quot;</span>]) == <span class="n">0</span>:
-<span class="ln">  75</span>        detail = reply.get(<span class="s">&quot;error&quot;</span>, reply)
-<span class="ln">  76</span>        <span class="k">raise</span> LLMError(f&quot;The provider returned no choices: {<span class="b">json</span>.dumps(detail)[:<span class="n">500</span>]}&quot;)
-<span class="ln">  77</span>
-<span class="ln">  78</span>    choice = reply[<span class="s">&quot;choices&quot;</span>][<span class="n">0</span>]
-<span class="ln">  79</span>    message = clean_assistant_message(choice[<span class="s">&quot;message&quot;</span>])
-<span class="ln">  80</span>    <span class="k">return</span> ModelReply(
-<span class="ln">  81</span>        message=message,
-<span class="ln">  82</span>        finish_reason=choice.get(<span class="s">&quot;finish_reason&quot;</span>, <span class="s">&quot;&quot;</span>),
-<span class="ln">  83</span>        usage=reply.get(<span class="s">&quot;usage&quot;</span>, {}),
-<span class="ln">  84</span>    )
-<span class="ln">  85</span>
-<span class="ln">  86</span>
-<span class="ln">  87</span><span class="k">def</span> clean_assistant_message(raw: <span class="b">dict</span>) -&gt; <span class="b">dict</span>:
-<span class="ln">  88</span>    <span class="d">&quot;&quot;&quot;Keep only the fields we are allowed to send back next turn.
-<span class="ln">  89</span>
-<span class="ln">  90</span>    Providers add extras (reasoning, annotations, refusal ...). Sending those
-<span class="ln">  91</span>    back to a *different* provider can cause a 400 error, so we keep the
-<span class="ln">  92</span>    three fields the API contract actually defines.
-<span class="ln">  93</span>    &quot;&quot;&quot;</span>
-<span class="ln">  94</span>    message = {<span class="s">&quot;role&quot;</span>: <span class="s">&quot;assistant&quot;</span>}
-<span class="ln">  95</span>    content = raw.get(<span class="s">&quot;content&quot;</span>)
-<span class="ln">  96</span>    tool_calls = raw.get(<span class="s">&quot;tool_calls&quot;</span>)
-<span class="ln">  97</span>    <span class="k">if</span> content <span class="k">is</span> <span class="k">not</span> <span class="k">None</span>:
-<span class="ln">  98</span>        message[<span class="s">&quot;content&quot;</span>] = content
-<span class="ln">  99</span>    <span class="k">if</span> tool_calls:
-<span class="ln"> 100</span>        message[<span class="s">&quot;tool_calls&quot;</span>] = tool_calls
-<span class="ln"> 101</span>    <span class="k">if</span> content <span class="k">is</span> <span class="k">None</span> <span class="k">and</span> <span class="k">not</span> tool_calls:
-<span class="ln"> 102</span>        message[<span class="s">&quot;content&quot;</span>] = <span class="s">&quot;&quot;</span>
-<span class="ln"> 103</span>    <span class="k">return</span> message
-<span class="ln"> 104</span>
-<span class="ln"> 105</span>
-<span class="ln"> 106</span><span class="k">def</span> explain_http_error(error: urllib.error.HTTPError) -&gt; <span class="b">str</span>:
-<span class="ln"> 107</span>    <span class="d">&quot;&quot;&quot;Turn an HTTP status into a sentence that says what to do next.&quot;&quot;&quot;</span>
-<span class="ln"> 108</span>    <span class="k">try</span>:
-<span class="ln"> 109</span>        body = error.read().decode(<span class="s">&quot;utf-8&quot;</span>)
-<span class="ln"> 110</span>    <span class="k">except</span> Exception:
-<span class="ln"> 111</span>        body = <span class="s">&quot;&quot;</span>
-<span class="ln"> 112</span>    hints = {
-<span class="ln"> 113</span>        <span class="n">400</span>: <span class="s">&quot;The request was rejected. Usually a bad model id, or a broken message order &quot;</span>
-<span class="ln"> 114</span>        <span class="s">&quot;(a tool result without its tool call, or a tool_call_id that does not match).&quot;</span>,
-<span class="ln"> 115</span>        <span class="n">401</span>: <span class="s">&quot;The API key was refused. Check LLM_API_KEY in .env.&quot;</span>,
-<span class="ln"> 116</span>        <span class="n">402</span>: <span class="s">&quot;Out of credits on this provider account.&quot;</span>,
-<span class="ln"> 117</span>        <span class="n">403</span>: <span class="s">&quot;This key is not allowed to use this model.&quot;</span>,
-<span class="ln"> 118</span>        <span class="n">404</span>: <span class="s">&quot;Model or endpoint not found. Check LLM_MODEL and LLM_BASE_URL.&quot;</span>,
-<span class="ln"> 119</span>        <span class="n">408</span>: <span class="s">&quot;The provider timed out. Try again.&quot;</span>,
-<span class="ln"> 120</span>        <span class="n">429</span>: <span class="s">&quot;Rate limited or the free tier is exhausted. Wait, or pick another model.&quot;</span>,
-<span class="ln"> 121</span>        <span class="n">500</span>: <span class="s">&quot;The provider had an internal error. Try again.&quot;</span>,
-<span class="ln"> 122</span>        <span class="n">502</span>: <span class="s">&quot;The provider behind the router failed. Try again or pick another model.&quot;</span>,
-<span class="ln"> 123</span>        <span class="n">503</span>: <span class="s">&quot;The model is temporarily unavailable. Try again shortly.&quot;</span>,
-<span class="ln"> 124</span>    }
-<span class="ln"> 125</span>    hint = hints.get(error.code, <span class="s">&quot;Unexpected HTTP error.&quot;</span>)
-<span class="ln"> 126</span>    <span class="k">return</span> f&quot;HTTP {error.code}: {hint}\nServer said: {body[:<span class="n">600</span>]}&quot;</code></pre></figure></details>
+<span class="ln">  50</span>    payload = {<span class="s">&quot;model&quot;</span>: settings.model, <span class="s">&quot;messages&quot;</span>: messages}
+<span class="ln">  51</span>    <span class="k">if</span> tools:
+<span class="ln">  52</span>        payload[<span class="s">&quot;tools&quot;</span>] = tools
+<span class="ln">  53</span>
+<span class="ln">  54</span>    request = urllib.request.Request(
+<span class="ln">  55</span>        url=settings.base_url.rstrip(<span class="s">&quot;/&quot;</span>) + <span class="s">&quot;/chat/completions&quot;</span>,
+<span class="ln">  56</span>        data=<span class="b">json</span>.dumps(payload).encode(<span class="s">&quot;utf-8&quot;</span>),
+<span class="ln">  57</span>        method=<span class="s">&quot;POST&quot;</span>,
+<span class="ln">  58</span>        headers={
+<span class="ln">  59</span>            <span class="s">&quot;Authorization&quot;</span>: <span class="s">&quot;Bearer &quot;</span> + settings.api_key,
+<span class="ln">  60</span>            <span class="s">&quot;Content-Type&quot;</span>: <span class="s">&quot;application/json&quot;</span>,
+<span class="ln">  61</span>            <span class="c"># OpenRouter shows these two on its dashboard; other providers ignore them.</span>
+<span class="ln">  62</span>            <span class="s">&quot;HTTP-Referer&quot;</span>: <span class="s">&quot;https://github.com/somachak/coding-agent-blueprint&quot;</span>,
+<span class="ln">  63</span>            <span class="s">&quot;X-Title&quot;</span>: <span class="s">&quot;coding-agent-blueprint&quot;</span>,
+<span class="ln">  64</span>        },
+<span class="ln">  65</span>    )
+<span class="ln">  66</span>
+<span class="ln">  67</span>    <span class="k">try</span>:
+<span class="ln">  68</span>        <span class="k">with</span> urllib.request.urlopen(request, timeout=settings.timeout_seconds) <span class="k">as</span> response:
+<span class="ln">  69</span>            body = response.read().decode(<span class="s">&quot;utf-8&quot;</span>, errors=<span class="s">&quot;replace&quot;</span>)
+<span class="ln">  70</span>    <span class="k">except</span> urllib.error.HTTPError <span class="k">as</span> error:
+<span class="ln">  71</span>        <span class="k">raise</span> LLMError(explain_http_error(error)) <span class="k">from</span> error
+<span class="ln">  72</span>    <span class="k">except</span> urllib.error.URLError <span class="k">as</span> error:
+<span class="ln">  73</span>        <span class="k">raise</span> LLMError(f&quot;Could not reach {settings.base_url}: {error.reason}&quot;) <span class="k">from</span> error
+<span class="ln">  74</span>    <span class="k">except</span> TimeoutError <span class="k">as</span> error:
+<span class="ln">  75</span>        <span class="k">raise</span> LLMError(f&quot;The model did not answer within {settings.timeout_seconds}s.&quot;) <span class="k">from</span> error
+<span class="ln">  76</span>
+<span class="ln">  77</span>    <span class="k">return</span> parse_reply(body)
+<span class="ln">  78</span>
+<span class="ln">  79</span>
+<span class="ln">  80</span><span class="k">def</span> parse_reply(body: <span class="b">str</span>) -&gt; ModelReply:
+<span class="ln">  81</span>    <span class="d">&quot;&quot;&quot;Check the provider&#x27;s reply piece by piece and build a ModelReply.
+<span class="ln">  82</span>
+<span class="ln">  83</span>    Every check raises LLMError with a plain sentence. The alternative,
+<span class="ln">  84</span>    letting a KeyError escape from deep inside the loop, would crash the
+<span class="ln">  85</span>    server and tell you nothing.
+<span class="ln">  86</span>    &quot;&quot;&quot;</span>
+<span class="ln">  87</span>    <span class="k">try</span>:
+<span class="ln">  88</span>        reply = <span class="b">json</span>.loads(body)
+<span class="ln">  89</span>    <span class="k">except</span> <span class="b">json</span>.JSONDecodeError:
+<span class="ln">  90</span>        <span class="k">raise</span> LLMError(f&quot;The provider did not return JSON. It said: {body[:<span class="n">300</span>]!r}&quot;) <span class="k">from</span> <span class="k">None</span>
+<span class="ln">  91</span>    <span class="k">if</span> <span class="k">not</span> <span class="b">isinstance</span>(reply, <span class="b">dict</span>):
+<span class="ln">  92</span>        <span class="k">raise</span> LLMError(<span class="s">&quot;The provider returned JSON that is not an object.&quot;</span>)
+<span class="ln">  93</span>
+<span class="ln">  94</span>    <span class="c"># Some providers return HTTP 200 with an error object inside the body.</span>
+<span class="ln">  95</span>    choices = reply.get(<span class="s">&quot;choices&quot;</span>)
+<span class="ln">  96</span>    <span class="k">if</span> <span class="k">not</span> <span class="b">isinstance</span>(choices, <span class="b">list</span>) <span class="k">or</span> <span class="b">len</span>(choices) == <span class="n">0</span>:
+<span class="ln">  97</span>        detail = reply.get(<span class="s">&quot;error&quot;</span>, reply)
+<span class="ln">  98</span>        <span class="k">raise</span> LLMError(f&quot;The provider returned no choices: {<span class="b">json</span>.dumps(detail)[:<span class="n">500</span>]}&quot;)
+<span class="ln">  99</span>
+<span class="ln"> 100</span>    choice = choices[<span class="n">0</span>]
+<span class="ln"> 101</span>    <span class="k">if</span> <span class="k">not</span> <span class="b">isinstance</span>(choice, <span class="b">dict</span>) <span class="k">or</span> <span class="k">not</span> <span class="b">isinstance</span>(choice.get(<span class="s">&quot;message&quot;</span>), <span class="b">dict</span>):
+<span class="ln"> 102</span>        <span class="k">raise</span> LLMError(f&quot;The provider&#x27;s first choice has no message: {<span class="b">json</span>.dumps(choice)[:<span class="n">300</span>]}&quot;)
+<span class="ln"> 103</span>
+<span class="ln"> 104</span>    message = clean_assistant_message(choice[<span class="s">&quot;message&quot;</span>])
+<span class="ln"> 105</span>    finish_reason = choice.get(<span class="s">&quot;finish_reason&quot;</span>)
+<span class="ln"> 106</span>    <span class="k">return</span> ModelReply(
+<span class="ln"> 107</span>        message=message,
+<span class="ln"> 108</span>        finish_reason=finish_reason <span class="k">if</span> <span class="b">isinstance</span>(finish_reason, <span class="b">str</span>) <span class="k">else</span> <span class="s">&quot;&quot;</span>,
+<span class="ln"> 109</span>        usage=clean_usage(reply.get(<span class="s">&quot;usage&quot;</span>)),
+<span class="ln"> 110</span>    )
+<span class="ln"> 111</span>
+<span class="ln"> 112</span>
+<span class="ln"> 113</span><span class="k">def</span> clean_assistant_message(raw: <span class="b">dict</span>) -&gt; <span class="b">dict</span>:
+<span class="ln"> 114</span>    <span class="d">&quot;&quot;&quot;Keep only the fields we are allowed to send back next turn, checked.
+<span class="ln"> 115</span>
+<span class="ln"> 116</span>    Providers add extras (reasoning, annotations, refusal ...). Sending those
+<span class="ln"> 117</span>    back to a *different* provider can cause a 400 error, so we keep the
+<span class="ln"> 118</span>    three fields the API contract actually defines. A refusal becomes
+<span class="ln"> 119</span>    visible text; a malformed tool call is an LLMError.
+<span class="ln"> 120</span>    &quot;&quot;&quot;</span>
+<span class="ln"> 121</span>    message = {<span class="s">&quot;role&quot;</span>: <span class="s">&quot;assistant&quot;</span>}
+<span class="ln"> 122</span>    content = raw.get(<span class="s">&quot;content&quot;</span>)
+<span class="ln"> 123</span>    <span class="k">if</span> <span class="b">isinstance</span>(content, <span class="b">list</span>):   <span class="c"># a few providers send content as parts</span>
+<span class="ln"> 124</span>        content = <span class="s">&quot;&quot;</span>.join(part.get(<span class="s">&quot;text&quot;</span>, <span class="s">&quot;&quot;</span>) <span class="k">for</span> part <span class="k">in</span> content <span class="k">if</span> <span class="b">isinstance</span>(part, <span class="b">dict</span>))
+<span class="ln"> 125</span>    <span class="k">if</span> content <span class="k">is</span> <span class="k">not</span> <span class="k">None</span> <span class="k">and</span> <span class="k">not</span> <span class="b">isinstance</span>(content, <span class="b">str</span>):
+<span class="ln"> 126</span>        content = <span class="b">str</span>(content)
+<span class="ln"> 127</span>
+<span class="ln"> 128</span>    refusal = raw.get(<span class="s">&quot;refusal&quot;</span>)
+<span class="ln"> 129</span>    <span class="k">if</span> <span class="b">isinstance</span>(refusal, <span class="b">str</span>) <span class="k">and</span> refusal.strip() <span class="k">and</span> <span class="k">not</span> content:
+<span class="ln"> 130</span>        content = <span class="s">&quot;The model refused: &quot;</span> + refusal.strip()
+<span class="ln"> 131</span>
+<span class="ln"> 132</span>    tool_calls = [clean_tool_call(call) <span class="k">for</span> call <span class="k">in</span> raw.get(<span class="s">&quot;tool_calls&quot;</span>) <span class="k">or</span> []]
+<span class="ln"> 133</span>
+<span class="ln"> 134</span>    <span class="k">if</span> content <span class="k">is</span> <span class="k">not</span> <span class="k">None</span>:
+<span class="ln"> 135</span>        message[<span class="s">&quot;content&quot;</span>] = content
+<span class="ln"> 136</span>    <span class="k">if</span> tool_calls:
+<span class="ln"> 137</span>        message[<span class="s">&quot;tool_calls&quot;</span>] = tool_calls
+<span class="ln"> 138</span>    <span class="k">if</span> content <span class="k">is</span> <span class="k">None</span> <span class="k">and</span> <span class="k">not</span> tool_calls:
+<span class="ln"> 139</span>        message[<span class="s">&quot;content&quot;</span>] = <span class="s">&quot;&quot;</span>
+<span class="ln"> 140</span>    <span class="k">return</span> message
+<span class="ln"> 141</span>
+<span class="ln"> 142</span>
+<span class="ln"> 143</span><span class="k">def</span> clean_tool_call(call) -&gt; <span class="b">dict</span>:
+<span class="ln"> 144</span>    <span class="d">&quot;&quot;&quot;A tool call must have an id, a name, and arguments as JSON TEXT.&quot;&quot;&quot;</span>
+<span class="ln"> 145</span>    <span class="k">if</span> <span class="k">not</span> <span class="b">isinstance</span>(call, <span class="b">dict</span>) <span class="k">or</span> <span class="k">not</span> <span class="b">isinstance</span>(call.get(<span class="s">&quot;function&quot;</span>), <span class="b">dict</span>):
+<span class="ln"> 146</span>        <span class="k">raise</span> LLMError(f&quot;The provider sent a malformed tool call: {<span class="b">json</span>.dumps(call)[:<span class="n">200</span>]}&quot;)
+<span class="ln"> 147</span>    function = call[<span class="s">&quot;function&quot;</span>]
+<span class="ln"> 148</span>    call_id = call.get(<span class="s">&quot;id&quot;</span>)
+<span class="ln"> 149</span>    name = function.get(<span class="s">&quot;name&quot;</span>)
+<span class="ln"> 150</span>    arguments = function.get(<span class="s">&quot;arguments&quot;</span>)
+<span class="ln"> 151</span>    <span class="k">if</span> <span class="k">not</span> <span class="b">isinstance</span>(call_id, <span class="b">str</span>) <span class="k">or</span> call_id == <span class="s">&quot;&quot;</span> <span class="k">or</span> <span class="k">not</span> <span class="b">isinstance</span>(name, <span class="b">str</span>) <span class="k">or</span> name == <span class="s">&quot;&quot;</span>:
+<span class="ln"> 152</span>        <span class="k">raise</span> LLMError(f&quot;The provider sent a tool call without an id or name: {<span class="b">json</span>.dumps(call)[:<span class="n">200</span>]}&quot;)
+<span class="ln"> 153</span>    <span class="k">if</span> <span class="b">isinstance</span>(arguments, <span class="b">dict</span>):       <span class="c"># some providers send the object instead of its text</span>
+<span class="ln"> 154</span>        arguments = <span class="b">json</span>.dumps(arguments)
+<span class="ln"> 155</span>    <span class="k">elif</span> arguments <span class="k">is</span> <span class="k">None</span>:
+<span class="ln"> 156</span>        arguments = <span class="s">&quot;{}&quot;</span>
+<span class="ln"> 157</span>    <span class="k">elif</span> <span class="k">not</span> <span class="b">isinstance</span>(arguments, <span class="b">str</span>):
+<span class="ln"> 158</span>        <span class="k">raise</span> LLMError(f&quot;The provider sent tool arguments that are not text: {<span class="b">json</span>.dumps(arguments)[:<span class="n">200</span>]}&quot;)
+<span class="ln"> 159</span>    <span class="k">return</span> {<span class="s">&quot;id&quot;</span>: call_id, <span class="s">&quot;type&quot;</span>: <span class="s">&quot;function&quot;</span>, <span class="s">&quot;function&quot;</span>: {<span class="s">&quot;name&quot;</span>: name, <span class="s">&quot;arguments&quot;</span>: arguments}}
+<span class="ln"> 160</span>
+<span class="ln"> 161</span>
+<span class="ln"> 162</span><span class="k">def</span> clean_usage(raw) -&gt; <span class="b">dict</span>:
+<span class="ln"> 163</span>    <span class="d">&quot;&quot;&quot;Token counts as non-negative whole numbers, or zeros if absent or odd.&quot;&quot;&quot;</span>
+<span class="ln"> 164</span>    usage = {}
+<span class="ln"> 165</span>    <span class="k">if</span> <span class="b">isinstance</span>(raw, <span class="b">dict</span>):
+<span class="ln"> 166</span>        <span class="k">for</span> key <span class="k">in</span> (<span class="s">&quot;prompt_tokens&quot;</span>, <span class="s">&quot;completion_tokens&quot;</span>, <span class="s">&quot;total_tokens&quot;</span>):
+<span class="ln"> 167</span>            value = raw.get(key, <span class="n">0</span>)
+<span class="ln"> 168</span>            usage[key] = value <span class="k">if</span> <span class="b">isinstance</span>(value, <span class="b">int</span>) <span class="k">and</span> <span class="k">not</span> <span class="b">isinstance</span>(value, bool) <span class="k">and</span> value &gt;= <span class="n">0</span> <span class="k">else</span> <span class="n">0</span>
+<span class="ln"> 169</span>    <span class="k">else</span>:
+<span class="ln"> 170</span>        usage = {<span class="s">&quot;prompt_tokens&quot;</span>: <span class="n">0</span>, <span class="s">&quot;completion_tokens&quot;</span>: <span class="n">0</span>, <span class="s">&quot;total_tokens&quot;</span>: <span class="n">0</span>}
+<span class="ln"> 171</span>    <span class="k">return</span> usage
+<span class="ln"> 172</span>
+<span class="ln"> 173</span>
+<span class="ln"> 174</span><span class="k">def</span> explain_http_error(error: urllib.error.HTTPError) -&gt; <span class="b">str</span>:
+<span class="ln"> 175</span>    <span class="d">&quot;&quot;&quot;Turn an HTTP status into a sentence that says what to do next.&quot;&quot;&quot;</span>
+<span class="ln"> 176</span>    <span class="k">try</span>:
+<span class="ln"> 177</span>        body = error.read().decode(<span class="s">&quot;utf-8&quot;</span>, errors=<span class="s">&quot;replace&quot;</span>)
+<span class="ln"> 178</span>    <span class="k">except</span> Exception:
+<span class="ln"> 179</span>        body = <span class="s">&quot;&quot;</span>
+<span class="ln"> 180</span>    hints = {
+<span class="ln"> 181</span>        <span class="n">400</span>: <span class="s">&quot;The request was rejected. Usually a bad model id, or a broken message order &quot;</span>
+<span class="ln"> 182</span>        <span class="s">&quot;(a tool result without its tool call, or a tool_call_id that does not match).&quot;</span>,
+<span class="ln"> 183</span>        <span class="n">401</span>: <span class="s">&quot;The API key was refused. Check LLM_API_KEY in .env.&quot;</span>,
+<span class="ln"> 184</span>        <span class="n">402</span>: <span class="s">&quot;Out of credits on this provider account.&quot;</span>,
+<span class="ln"> 185</span>        <span class="n">403</span>: <span class="s">&quot;This key is not allowed to use this model.&quot;</span>,
+<span class="ln"> 186</span>        <span class="n">404</span>: <span class="s">&quot;Model or endpoint not found. Check LLM_MODEL and LLM_BASE_URL.&quot;</span>,
+<span class="ln"> 187</span>        <span class="n">408</span>: <span class="s">&quot;The provider timed out. Try again.&quot;</span>,
+<span class="ln"> 188</span>        <span class="n">429</span>: <span class="s">&quot;Rate limited or the free tier is exhausted. Wait, or pick another model.&quot;</span>,
+<span class="ln"> 189</span>        <span class="n">500</span>: <span class="s">&quot;The provider had an internal error. Try again.&quot;</span>,
+<span class="ln"> 190</span>        <span class="n">502</span>: <span class="s">&quot;The provider behind the router failed. Try again or pick another model.&quot;</span>,
+<span class="ln"> 191</span>        <span class="n">503</span>: <span class="s">&quot;The model is temporarily unavailable. Try again shortly.&quot;</span>,
+<span class="ln"> 192</span>    }
+<span class="ln"> 193</span>    hint = hints.get(error.code, <span class="s">&quot;Unexpected HTTP error.&quot;</span>)
+<span class="ln"> 194</span>    <span class="k">return</span> f&quot;HTTP {error.code}: {hint}\nServer said: {body[:<span class="n">600</span>]}&quot;</code></pre></figure></details>
 <details><summary>How it is wired together: agent/__init__.py</summary><figure class="code"><figcaption><span class="path">agent/__init__.py</span><span class="hint">real file, embedded at build time</span></figcaption><pre><code><span class="ln">   1</span><span class="d">&quot;&quot;&quot;
 <span class="ln">   2</span>agent - a bare-bones, model-agnostic coding agent you can read in one sitting.
 <span class="ln">   3</span>
@@ -1640,56 +1862,67 @@ python3 -m agent.server                       # chat in the browser at http://12
 <span class="ln">  37</span>
 <span class="ln">  38</span>    workspace = Workspace(settings.workspace)
 <span class="ln">  39</span>    registry = ToolRegistry(build_tools(workspace))
-<span class="ln">  40</span>
-<span class="ln">  41</span>    <span class="k">def</span> llm(messages: <span class="b">list</span>[<span class="b">dict</span>], tool_schemas: <span class="b">list</span>[<span class="b">dict</span>]):
-<span class="ln">  42</span>        <span class="d">&quot;&quot;&quot;The loop calls this. It only knows: messages in, reply out.&quot;&quot;&quot;</span>
-<span class="ln">  43</span>        <span class="k">return</span> chat(messages, tool_schemas, settings)
-<span class="ln">  44</span>
-<span class="ln">  45</span>    system_prompt = build_system_prompt(workspace)
-<span class="ln">  46</span>    <span class="k">return</span> Agent(
-<span class="ln">  47</span>        llm=llm,
-<span class="ln">  48</span>        tools=registry,
-<span class="ln">  49</span>        system_prompt=system_prompt,
-<span class="ln">  50</span>        max_steps=settings.max_steps,
-<span class="ln">  51</span>        context_window=settings.context_window,
-<span class="ln">  52</span>    )
-<span class="ln">  53</span>
-<span class="ln">  54</span>
-<span class="ln">  55</span><span class="k">def</span> build_system_prompt(workspace: Workspace) -&gt; <span class="b">str</span>:
-<span class="ln">  56</span>    <span class="d">&quot;&quot;&quot;The standing instructions the model sees first, every single call.
+<span class="ln">  40</span>    system_prompt = build_system_prompt(workspace)
+<span class="ln">  41</span>    <span class="k">return</span> Agent(
+<span class="ln">  42</span>        llm=make_llm(settings),
+<span class="ln">  43</span>        tools=registry,
+<span class="ln">  44</span>        system_prompt=system_prompt,
+<span class="ln">  45</span>        max_steps=settings.max_steps,
+<span class="ln">  46</span>        context_window=settings.context_window,
+<span class="ln">  47</span>    )
+<span class="ln">  48</span>
+<span class="ln">  49</span>
+<span class="ln">  50</span><span class="k">def</span> make_llm(settings: Settings):
+<span class="ln">  51</span>    <span class="d">&quot;&quot;&quot;Bind chat() to one Settings object.
+<span class="ln">  52</span>
+<span class="ln">  53</span>    The loop calls the result with (messages, tool_schemas) and never sees
+<span class="ln">  54</span>    the key, the URL or the model name. To run with different settings,
+<span class="ln">  55</span>    make a new llm function; the old Settings object is never changed.
+<span class="ln">  56</span>    &quot;&quot;&quot;</span>
 <span class="ln">  57</span>
-<span class="ln">  58</span>    If the workspace contains an AGENTS.md file, its text is appended, so a
-<span class="ln">  59</span>    project can teach the agent its own rules without touching this code.
-<span class="ln">  60</span>    &quot;&quot;&quot;</span>
-<span class="ln">  61</span>    prompt = (
-<span class="ln">  62</span>        <span class="s">&quot;You are a careful coding agent working inside one workspace folder.\n&quot;</span>
-<span class="ln">  63</span>        <span class="s">&quot;You can only see and change files through your tools. Rules:\n&quot;</span>
-<span class="ln">  64</span>        <span class="s">&quot;1. Look before you touch: list_files or read_file before editing.\n&quot;</span>
-<span class="ln">  65</span>        <span class="s">&quot;2. Make small, precise edits with edit_file; use write_file only for new files.\n&quot;</span>
-<span class="ln">  66</span>        <span class="s">&quot;3. After changing code, run it with run_command to check it works.\n&quot;</span>
-<span class="ln">  67</span>        <span class="s">&quot;4. When the job is done, reply with a short plain-language summary of what you did.\n&quot;</span>
-<span class="ln">  68</span>        <span class="s">&quot;5. If something fails, read the error, fix the cause, and try again. Do not guess.\n&quot;</span>
-<span class="ln">  69</span>        f&quot;Workspace root: {workspace.root}\n&quot;
-<span class="ln">  70</span>    )
-<span class="ln">  71</span>    instructions = workspace.read_instructions()
-<span class="ln">  72</span>    <span class="k">if</span> instructions:
-<span class="ln">  73</span>        prompt = prompt + <span class="s">&quot;\nProject instructions (from AGENTS.md):\n&quot;</span> + instructions
-<span class="ln">  74</span>    <span class="k">return</span> prompt
-<span class="ln">  75</span>
-<span class="ln">  76</span>
-<span class="ln">  77</span>__all__ = [
-<span class="ln">  78</span>    <span class="s">&quot;Agent&quot;</span>,
-<span class="ln">  79</span>    <span class="s">&quot;LLMError&quot;</span>,
-<span class="ln">  80</span>    <span class="s">&quot;Settings&quot;</span>,
-<span class="ln">  81</span>    <span class="s">&quot;Tool&quot;</span>,
-<span class="ln">  82</span>    <span class="s">&quot;ToolRegistry&quot;</span>,
-<span class="ln">  83</span>    <span class="s">&quot;Workspace&quot;</span>,
-<span class="ln">  84</span>    <span class="s">&quot;build_system_prompt&quot;</span>,
-<span class="ln">  85</span>    <span class="s">&quot;build_tools&quot;</span>,
-<span class="ln">  86</span>    <span class="s">&quot;chat&quot;</span>,
-<span class="ln">  87</span>    <span class="s">&quot;create_agent&quot;</span>,
-<span class="ln">  88</span>    <span class="s">&quot;load_settings&quot;</span>,
-<span class="ln">  89</span>]</code></pre></figure></details>
+<span class="ln">  58</span>    <span class="k">def</span> llm(messages: <span class="b">list</span>[<span class="b">dict</span>], tool_schemas: <span class="b">list</span>[<span class="b">dict</span>]):
+<span class="ln">  59</span>        <span class="k">return</span> chat(messages, tool_schemas, settings)
+<span class="ln">  60</span>
+<span class="ln">  61</span>    llm.settings = settings   <span class="c"># lets server.py tell a real model apart from a fake one</span>
+<span class="ln">  62</span>    <span class="k">return</span> llm
+<span class="ln">  63</span>
+<span class="ln">  64</span>
+<span class="ln">  65</span><span class="k">def</span> build_system_prompt(workspace: Workspace) -&gt; <span class="b">str</span>:
+<span class="ln">  66</span>    <span class="d">&quot;&quot;&quot;The standing instructions the model sees first, every single call.
+<span class="ln">  67</span>
+<span class="ln">  68</span>    If the workspace contains an AGENTS.md file, its text is appended, so a
+<span class="ln">  69</span>    project can teach the agent its own rules without touching this code.
+<span class="ln">  70</span>    &quot;&quot;&quot;</span>
+<span class="ln">  71</span>    prompt = (
+<span class="ln">  72</span>        <span class="s">&quot;You are a careful coding agent working inside one workspace folder.\n&quot;</span>
+<span class="ln">  73</span>        <span class="s">&quot;You can only see and change files through your tools. Rules:\n&quot;</span>
+<span class="ln">  74</span>        <span class="s">&quot;1. Look before you touch: list_files or read_file before editing.\n&quot;</span>
+<span class="ln">  75</span>        <span class="s">&quot;2. Make small, precise edits with edit_file; use write_file only for new files.\n&quot;</span>
+<span class="ln">  76</span>        <span class="s">&quot;3. After changing code, run it with run_command to check it works.\n&quot;</span>
+<span class="ln">  77</span>        <span class="s">&quot;4. When the job is done, reply with a short plain-language summary of what you did.\n&quot;</span>
+<span class="ln">  78</span>        <span class="s">&quot;5. If something fails, read the error, fix the cause, and try again. Do not guess.\n&quot;</span>
+<span class="ln">  79</span>        f&quot;Workspace root: {workspace.root}\n&quot;
+<span class="ln">  80</span>    )
+<span class="ln">  81</span>    instructions = workspace.read_instructions()
+<span class="ln">  82</span>    <span class="k">if</span> instructions:
+<span class="ln">  83</span>        prompt = prompt + <span class="s">&quot;\nProject instructions (from AGENTS.md):\n&quot;</span> + instructions
+<span class="ln">  84</span>    <span class="k">return</span> prompt
+<span class="ln">  85</span>
+<span class="ln">  86</span>
+<span class="ln">  87</span>__all__ = [
+<span class="ln">  88</span>    <span class="s">&quot;Agent&quot;</span>,
+<span class="ln">  89</span>    <span class="s">&quot;LLMError&quot;</span>,
+<span class="ln">  90</span>    <span class="s">&quot;Settings&quot;</span>,
+<span class="ln">  91</span>    <span class="s">&quot;Tool&quot;</span>,
+<span class="ln">  92</span>    <span class="s">&quot;ToolRegistry&quot;</span>,
+<span class="ln">  93</span>    <span class="s">&quot;Workspace&quot;</span>,
+<span class="ln">  94</span>    <span class="s">&quot;build_system_prompt&quot;</span>,
+<span class="ln">  95</span>    <span class="s">&quot;build_tools&quot;</span>,
+<span class="ln">  96</span>    <span class="s">&quot;chat&quot;</span>,
+<span class="ln">  97</span>    <span class="s">&quot;create_agent&quot;</span>,
+<span class="ln">  98</span>    <span class="s">&quot;load_settings&quot;</span>,
+<span class="ln">  99</span>    <span class="s">&quot;make_llm&quot;</span>,
+<span class="ln"> 100</span>]</code></pre></figure></details>
 
 <h3>The fake model: how you test without spending money</h3>
 <p><code>agent/fake_llm.py</code> is a scripted stand-in. You write the list of replies; it plays them back. Chapters 6 to 10 and all 35 tests run on it. When something goes wrong with the real agent, replaying the same script here tells you whether the bug is in your loop or in the model's behaviour.</p>
@@ -1817,188 +2050,322 @@ python3 -m agent.server                       # chat in the browser at http://12
 <span class="ln">  14</span>reply at the end, we keep the connection open and write one line per
 <span class="ln">  15</span>event as the loop reports it:  &quot;data: {...json...}\\n\\n&quot;.  That is the
 <span class="ln">  16</span>entire Server-Sent Events format. The page reads the lines as they arrive.
-<span class="ln">  17</span>&quot;&quot;&quot;</span>
-<span class="ln">  18</span>
-<span class="ln">  19</span><span class="k">import</span> <span class="b">json</span>
-<span class="ln">  20</span><span class="k">import</span> os
-<span class="ln">  21</span><span class="k">import</span> sys
-<span class="ln">  22</span><span class="k">import</span> threading
-<span class="ln">  23</span><span class="k">from</span> http.server <span class="k">import</span> BaseHTTPRequestHandler, ThreadingHTTPServer
-<span class="ln">  24</span>
-<span class="ln">  25</span><span class="k">from</span> . <span class="k">import</span> create_agent
-<span class="ln">  26</span><span class="k">from</span> .config <span class="k">import</span> PROJECT_ROOT, load_settings
-<span class="ln">  27</span>
-<span class="ln">  28</span>WEB_DIR = os.path.join(PROJECT_ROOT, <span class="s">&quot;web&quot;</span>)
-<span class="ln">  29</span>HOST = os.environ.get(<span class="s">&quot;AGENT_HOST&quot;</span>, <span class="s">&quot;127.0.0.1&quot;</span>)
-<span class="ln">  30</span>PORT = <span class="b">int</span>(os.environ.get(<span class="s">&quot;AGENT_PORT&quot;</span>, <span class="s">&quot;8765&quot;</span>))
-<span class="ln">  31</span>
-<span class="ln">  32</span><span class="c"># Web pages served from OTHER origins (for example the hosted course site)</span>
-<span class="ln">  33</span><span class="c"># may talk to this server only if their origin is listed here. Anything</span>
-<span class="ln">  34</span><span class="c"># else is refused by the browser, which is what keeps a random website from</span>
-<span class="ln">  35</span><span class="c"># driving the agent on your machine.</span>
-<span class="ln">  36</span>ALLOWED_ORIGINS = [
-<span class="ln">  37</span>    origin.strip()
-<span class="ln">  38</span>    <span class="k">for</span> origin <span class="k">in</span> os.environ.get(<span class="s">&quot;AGENT_ALLOWED_ORIGINS&quot;</span>, <span class="s">&quot;https://coding-agent-blueprint.pixelartinc.workers.dev&quot;</span>).split(<span class="s">&quot;,&quot;</span>)
-<span class="ln">  39</span>    <span class="k">if</span> origin.strip()
-<span class="ln">  40</span>]
+<span class="ln">  17</span>
+<span class="ln">  18</span>Three rules this file enforces, each in one small function:
+<span class="ln">  19</span>
+<span class="ln">  20</span>  check_origin        a page from another website may not drive this agent
+<span class="ln">  21</span>  read_json_object    a request must be a small JSON object, or it is refused
+<span class="ln">  22</span>  settings_for_run    settings for one run are chosen BEFORE the run and
+<span class="ln">  23</span>                      never changed during it; they become the active
+<span class="ln">  24</span>                      settings only if the run succeeds
+<span class="ln">  25</span>
+<span class="ln">  26</span>One agent, one conversation, one run at a time. `run_lock` is what makes
+<span class="ln">  27</span>&quot;one at a time&quot; true: /chat and /reset both take it, and a request that
+<span class="ln">  28</span>cannot get it is answered 409 and changes nothing.
+<span class="ln">  29</span>&quot;&quot;&quot;</span>
+<span class="ln">  30</span>
+<span class="ln">  31</span><span class="k">import</span> dataclasses
+<span class="ln">  32</span><span class="k">import</span> <span class="b">json</span>
+<span class="ln">  33</span><span class="k">import</span> os
+<span class="ln">  34</span><span class="k">import</span> sys
+<span class="ln">  35</span><span class="k">import</span> threading
+<span class="ln">  36</span><span class="k">from</span> http.server <span class="k">import</span> BaseHTTPRequestHandler, ThreadingHTTPServer
+<span class="ln">  37</span><span class="k">from</span> urllib.parse <span class="k">import</span> urlsplit
+<span class="ln">  38</span>
+<span class="ln">  39</span><span class="k">from</span> . <span class="k">import</span> create_agent, make_llm
+<span class="ln">  40</span><span class="k">from</span> .config <span class="k">import</span> PROJECT_ROOT, load_settings
 <span class="ln">  41</span>
-<span class="ln">  42</span><span class="c"># One agent, one conversation, one run at a time. Fine for a local tool.</span>
-<span class="ln">  43</span><span class="c"># A multi-user deployment would keep one agent per session id instead.</span>
-<span class="ln">  44</span><span class="c"># `serve()` fills these in; the course runs the same server with a fake model.</span>
-<span class="ln">  45</span>settings = <span class="k">None</span>
-<span class="ln">  46</span>agent = <span class="k">None</span>
-<span class="ln">  47</span>run_lock = threading.Lock()
+<span class="ln">  42</span>WEB_DIR = os.path.join(PROJECT_ROOT, <span class="s">&quot;web&quot;</span>)
+<span class="ln">  43</span>HOST = os.environ.get(<span class="s">&quot;AGENT_HOST&quot;</span>, <span class="s">&quot;127.0.0.1&quot;</span>)
+<span class="ln">  44</span>PORT = <span class="b">int</span>(os.environ.get(<span class="s">&quot;AGENT_PORT&quot;</span>, <span class="s">&quot;8765&quot;</span>))
+<span class="ln">  45</span>
+<span class="ln">  46</span>MAX_BODY_BYTES = <span class="n">64_000</span>        <span class="c"># a chat request is a sentence or a paragraph, not a file</span>
+<span class="ln">  47</span>MAX_TEXT_CHARS = <span class="n">20_000</span>
 <span class="ln">  48</span>
-<span class="ln">  49</span>
-<span class="ln">  50</span><span class="k">class</span> Handler(BaseHTTPRequestHandler):
-<span class="ln">  51</span>    <span class="c"># ----- helpers ---------------------------------------------------------</span>
-<span class="ln">  52</span>
-<span class="ln">  53</span>    <span class="k">def</span> send_json(self, status: <span class="b">int</span>, payload: <span class="b">dict</span>) -&gt; <span class="k">None</span>:
-<span class="ln">  54</span>        body = <span class="b">json</span>.dumps(payload).encode(<span class="s">&quot;utf-8&quot;</span>)
-<span class="ln">  55</span>        self.send_response(status)
-<span class="ln">  56</span>        self.send_header(<span class="s">&quot;Content-Type&quot;</span>, <span class="s">&quot;application/json&quot;</span>)
-<span class="ln">  57</span>        self.send_header(<span class="s">&quot;Content-Length&quot;</span>, <span class="b">str</span>(<span class="b">len</span>(body)))
-<span class="ln">  58</span>        self.send_cors_headers()
-<span class="ln">  59</span>        self.end_headers()
-<span class="ln">  60</span>        self.wfile.write(body)
-<span class="ln">  61</span>
-<span class="ln">  62</span>    <span class="k">def</span> send_cors_headers(self) -&gt; <span class="k">None</span>:
-<span class="ln">  63</span>        origin = self.headers.get(<span class="s">&quot;Origin&quot;</span>, <span class="s">&quot;&quot;</span>)
-<span class="ln">  64</span>        <span class="k">if</span> origin <span class="k">in</span> ALLOWED_ORIGINS:
-<span class="ln">  65</span>            self.send_header(<span class="s">&quot;Access-Control-Allow-Origin&quot;</span>, origin)
-<span class="ln">  66</span>            self.send_header(<span class="s">&quot;Vary&quot;</span>, <span class="s">&quot;Origin&quot;</span>)
-<span class="ln">  67</span>
-<span class="ln">  68</span>    <span class="k">def</span> do_OPTIONS(self) -&gt; <span class="k">None</span>:
-<span class="ln">  69</span>        <span class="d">&quot;&quot;&quot;The browser asks permission before a cross-origin POST. Answer it.&quot;&quot;&quot;</span>
-<span class="ln">  70</span>        self.send_response(<span class="n">204</span>)
-<span class="ln">  71</span>        self.send_cors_headers()
-<span class="ln">  72</span>        self.send_header(<span class="s">&quot;Access-Control-Allow-Methods&quot;</span>, <span class="s">&quot;GET, POST, OPTIONS&quot;</span>)
-<span class="ln">  73</span>        self.send_header(<span class="s">&quot;Access-Control-Allow-Headers&quot;</span>, <span class="s">&quot;Content-Type&quot;</span>)
-<span class="ln">  74</span>        self.send_header(<span class="s">&quot;Access-Control-Max-Age&quot;</span>, <span class="s">&quot;600&quot;</span>)
-<span class="ln">  75</span>        self.end_headers()
-<span class="ln">  76</span>
-<span class="ln">  77</span>    <span class="k">def</span> apply_setting_overrides(self, overrides: <span class="b">dict</span>) -&gt; <span class="k">None</span>:
-<span class="ln">  78</span>        <span class="d">&quot;&quot;&quot;Let the page choose the key, endpoint and model for this conversation.
+<span class="ln">  49</span><span class="c"># Web pages served from OTHER origins (for example the hosted course site)</span>
+<span class="ln">  50</span><span class="c"># may talk to this server only if their origin is listed here. The same</span>
+<span class="ln">  51</span><span class="c"># list is used twice: to answer the browser&#x27;s CORS question, and to refuse</span>
+<span class="ln">  52</span><span class="c"># the request itself, because CORS alone does not stop a request running.</span>
+<span class="ln">  53</span>ALLOWED_ORIGINS = [
+<span class="ln">  54</span>    origin.strip()
+<span class="ln">  55</span>    <span class="k">for</span> origin <span class="k">in</span> os.environ.get(<span class="s">&quot;AGENT_ALLOWED_ORIGINS&quot;</span>, <span class="s">&quot;https://coding-agent-blueprint.pixelartinc.workers.dev&quot;</span>).split(<span class="s">&quot;,&quot;</span>)
+<span class="ln">  56</span>    <span class="k">if</span> origin.strip()
+<span class="ln">  57</span>]
+<span class="ln">  58</span>
+<span class="ln">  59</span><span class="c"># The page may switch provider URL only to OpenRouter or to the URL from</span>
+<span class="ln">  60</span><span class="c"># .env, unless you opt in to anything: AGENT_ALLOW_ANY_PROVIDER=1 for local</span>
+<span class="ln">  61</span><span class="c"># experiments with other OpenAI-compatible servers.</span>
+<span class="ln">  62</span>OPENROUTER_URL = <span class="s">&quot;https://openrouter.ai/api/v1&quot;</span>
+<span class="ln">  63</span>ALLOW_ANY_PROVIDER = os.environ.get(<span class="s">&quot;AGENT_ALLOW_ANY_PROVIDER&quot;</span>, <span class="s">&quot;&quot;</span>) == <span class="s">&quot;1&quot;</span>
+<span class="ln">  64</span>
+<span class="ln">  65</span><span class="c"># `serve()` fills these in; the course runs the same server with a fake model.</span>
+<span class="ln">  66</span>settings = <span class="k">None</span>          <span class="c"># the ACTIVE settings: what /state reports</span>
+<span class="ln">  67</span>agent = <span class="k">None</span>
+<span class="ln">  68</span>run_lock = threading.Lock()
+<span class="ln">  69</span>
+<span class="ln">  70</span>
+<span class="ln">  71</span><span class="k">class</span> EventStream:
+<span class="ln">  72</span>    <span class="d">&quot;&quot;&quot;Writes loop events to the browser, and keeps going quietly if it left.
+<span class="ln">  73</span>
+<span class="ln">  74</span>    The loop must finish its bookkeeping (every tool call answered) even if
+<span class="ln">  75</span>    the tab was closed half way. So a broken connection is remembered in
+<span class="ln">  76</span>    `alive`, and later events are simply dropped instead of raising into
+<span class="ln">  77</span>    the loop.
+<span class="ln">  78</span>    &quot;&quot;&quot;</span>
 <span class="ln">  79</span>
-<span class="ln">  80</span>        The values live only in memory, in this process. Nothing is written
-<span class="ln">  81</span>        to disk. The llm function reads `settings` on every call, so the
-<span class="ln">  82</span>        change takes effect on the very next model call.
-<span class="ln">  83</span>        &quot;&quot;&quot;</span>
-<span class="ln">  84</span>        <span class="k">for</span> name <span class="k">in</span> (<span class="s">&quot;api_key&quot;</span>, <span class="s">&quot;base_url&quot;</span>, <span class="s">&quot;model&quot;</span>):
-<span class="ln">  85</span>            value = <span class="b">str</span>(overrides.get(name, <span class="s">&quot;&quot;</span>)).strip()
-<span class="ln">  86</span>            <span class="k">if</span> value:
-<span class="ln">  87</span>                setattr(settings, name, value)
-<span class="ln">  88</span>
-<span class="ln">  89</span>    <span class="k">def</span> read_json_body(self) -&gt; <span class="b">dict</span>:
-<span class="ln">  90</span>        length = <span class="b">int</span>(self.headers.get(<span class="s">&quot;Content-Length&quot;</span>, <span class="s">&quot;0&quot;</span>))
-<span class="ln">  91</span>        raw = self.rfile.read(length) <span class="k">if</span> length &gt; <span class="n">0</span> <span class="k">else</span> <span class="s">b&quot;{}&quot;</span>
-<span class="ln">  92</span>        <span class="k">try</span>:
-<span class="ln">  93</span>            <span class="k">return</span> <span class="b">json</span>.loads(raw.decode(<span class="s">&quot;utf-8&quot;</span>))
-<span class="ln">  94</span>        <span class="k">except</span> <span class="b">json</span>.JSONDecodeError:
-<span class="ln">  95</span>            <span class="k">return</span> {}
+<span class="ln">  80</span>    <span class="k">def</span> __init__(self, wfile):
+<span class="ln">  81</span>        self.wfile = wfile
+<span class="ln">  82</span>        self.alive = <span class="k">True</span>
+<span class="ln">  83</span>        self.saw_error = <span class="k">False</span>
+<span class="ln">  84</span>
+<span class="ln">  85</span>    <span class="k">def</span> send(self, event: <span class="b">dict</span>) -&gt; <span class="k">None</span>:
+<span class="ln">  86</span>        <span class="k">if</span> event.get(<span class="s">&quot;type&quot;</span>) == <span class="s">&quot;error&quot;</span>:
+<span class="ln">  87</span>            self.saw_error = <span class="k">True</span>
+<span class="ln">  88</span>        <span class="k">if</span> <span class="k">not</span> self.alive:
+<span class="ln">  89</span>            <span class="k">return</span>
+<span class="ln">  90</span>        <span class="k">try</span>:
+<span class="ln">  91</span>            self.wfile.write((<span class="s">&quot;data: &quot;</span> + <span class="b">json</span>.dumps(event) + <span class="s">&quot;\n\n&quot;</span>).encode(<span class="s">&quot;utf-8&quot;</span>))
+<span class="ln">  92</span>            self.wfile.flush()
+<span class="ln">  93</span>        <span class="k">except</span> (BrokenPipeError, ConnectionResetError, OSError):
+<span class="ln">  94</span>            self.alive = <span class="k">False</span>
+<span class="ln">  95</span>
 <span class="ln">  96</span>
-<span class="ln">  97</span>    <span class="k">def</span> log_message(self, format, *args):  <span class="c"># noqa: A002 - quieter default logging</span>
-<span class="ln">  98</span>        sys.stderr.write(<span class="s">&quot;  http: &quot;</span> + (format % args) + <span class="s">&quot;\n&quot;</span>)
+<span class="ln">  97</span><span class="k">def</span> settings_for_run(active, overrides: <span class="b">dict</span>):
+<span class="ln">  98</span>    <span class="d">&quot;&quot;&quot;Return (settings for this run, problem text or None).
 <span class="ln">  99</span>
-<span class="ln"> 100</span>    <span class="c"># ----- routes ------------------------------------------------------------</span>
-<span class="ln"> 101</span>
-<span class="ln"> 102</span>    <span class="k">def</span> do_GET(self) -&gt; <span class="k">None</span>:
-<span class="ln"> 103</span>        <span class="k">if</span> self.path == <span class="s">&quot;/&quot;</span> <span class="k">or</span> self.path.startswith(<span class="s">&quot;/?&quot;</span>):
-<span class="ln"> 104</span>            self.serve_file(<span class="s">&quot;index.html&quot;</span>, <span class="s">&quot;text/html; charset=utf-8&quot;</span>)
-<span class="ln"> 105</span>        <span class="k">elif</span> self.path == <span class="s">&quot;/state&quot;</span>:
-<span class="ln"> 106</span>            self.send_json(<span class="n">200</span>, {
-<span class="ln"> 107</span>                <span class="s">&quot;messages&quot;</span>: agent.messages,
-<span class="ln"> 108</span>                <span class="s">&quot;usage&quot;</span>: agent.total_usage,
-<span class="ln"> 109</span>                <span class="s">&quot;model&quot;</span>: settings.model,
-<span class="ln"> 110</span>                <span class="s">&quot;base_url&quot;</span>: settings.base_url,
-<span class="ln"> 111</span>                <span class="s">&quot;workspace&quot;</span>: settings.workspace,
-<span class="ln"> 112</span>                <span class="s">&quot;tools&quot;</span>: agent.tools.names(),
-<span class="ln"> 113</span>                <span class="s">&quot;missing&quot;</span>: settings.missing(),
-<span class="ln"> 114</span>            })
-<span class="ln"> 115</span>        <span class="k">else</span>:
-<span class="ln"> 116</span>            self.send_json(<span class="n">404</span>, {<span class="s">&quot;error&quot;</span>: <span class="s">&quot;not found&quot;</span>})
-<span class="ln"> 117</span>
-<span class="ln"> 118</span>    <span class="k">def</span> do_POST(self) -&gt; <span class="k">None</span>:
-<span class="ln"> 119</span>        <span class="k">if</span> self.path == <span class="s">&quot;/reset&quot;</span>:
-<span class="ln"> 120</span>            agent.reset()
-<span class="ln"> 121</span>            self.send_json(<span class="n">200</span>, {<span class="s">&quot;ok&quot;</span>: <span class="k">True</span>})
-<span class="ln"> 122</span>        <span class="k">elif</span> self.path == <span class="s">&quot;/chat&quot;</span>:
-<span class="ln"> 123</span>            self.handle_chat()
-<span class="ln"> 124</span>        <span class="k">else</span>:
-<span class="ln"> 125</span>            self.send_json(<span class="n">404</span>, {<span class="s">&quot;error&quot;</span>: <span class="s">&quot;not found&quot;</span>})
-<span class="ln"> 126</span>
-<span class="ln"> 127</span>    <span class="k">def</span> serve_file(self, name: <span class="b">str</span>, content_type: <span class="b">str</span>) -&gt; <span class="k">None</span>:
-<span class="ln"> 128</span>        path = os.path.join(WEB_DIR, name)
-<span class="ln"> 129</span>        <span class="k">with</span> <span class="b">open</span>(path, <span class="s">&quot;rb&quot;</span>) <span class="k">as</span> file:
-<span class="ln"> 130</span>            body = file.read()
-<span class="ln"> 131</span>        self.send_response(<span class="n">200</span>)
-<span class="ln"> 132</span>        self.send_header(<span class="s">&quot;Content-Type&quot;</span>, content_type)
-<span class="ln"> 133</span>        self.send_header(<span class="s">&quot;Content-Length&quot;</span>, <span class="b">str</span>(<span class="b">len</span>(body)))
-<span class="ln"> 134</span>        self.send_cors_headers()
-<span class="ln"> 135</span>        self.end_headers()
-<span class="ln"> 136</span>        self.wfile.write(body)
+<span class="ln"> 100</span>    A copy of the active settings with the page&#x27;s overrides applied. Rules:
+<span class="ln"> 101</span>      - a new provider URL must come with its own key (never reuse a key
+<span class="ln"> 102</span>        across providers);
+<span class="ln"> 103</span>      - remote provider URLs must be https; plain http only for localhost;
+<span class="ln"> 104</span>      - only OpenRouter or the URL from .env, unless AGENT_ALLOW_ANY_PROVIDER=1.
+<span class="ln"> 105</span>    &quot;&quot;&quot;</span>
+<span class="ln"> 106</span>    model = <span class="b">str</span>(overrides.get(<span class="s">&quot;model&quot;</span>, <span class="s">&quot;&quot;</span>)).strip()
+<span class="ln"> 107</span>    base_url = <span class="b">str</span>(overrides.get(<span class="s">&quot;base_url&quot;</span>, <span class="s">&quot;&quot;</span>)).strip().rstrip(<span class="s">&quot;/&quot;</span>)
+<span class="ln"> 108</span>    api_key = <span class="b">str</span>(overrides.get(<span class="s">&quot;api_key&quot;</span>, <span class="s">&quot;&quot;</span>)).strip()
+<span class="ln"> 109</span>
+<span class="ln"> 110</span>    changes = {}
+<span class="ln"> 111</span>    <span class="k">if</span> model:
+<span class="ln"> 112</span>        changes[<span class="s">&quot;model&quot;</span>] = model
+<span class="ln"> 113</span>    <span class="k">if</span> base_url <span class="k">and</span> base_url != active.base_url:
+<span class="ln"> 114</span>        <span class="k">if</span> <span class="k">not</span> api_key:
+<span class="ln"> 115</span>            <span class="k">return</span> <span class="k">None</span>, <span class="s">&quot;A different provider URL needs its own API key. Enter the URL and the key together.&quot;</span>
+<span class="ln"> 116</span>        problem = check_provider_url(base_url, active.base_url)
+<span class="ln"> 117</span>        <span class="k">if</span> problem:
+<span class="ln"> 118</span>            <span class="k">return</span> <span class="k">None</span>, problem
+<span class="ln"> 119</span>        changes[<span class="s">&quot;base_url&quot;</span>] = base_url
+<span class="ln"> 120</span>    <span class="k">if</span> api_key:
+<span class="ln"> 121</span>        changes[<span class="s">&quot;api_key&quot;</span>] = api_key
+<span class="ln"> 122</span>    <span class="k">return</span> dataclasses.replace(active, **changes), <span class="k">None</span>
+<span class="ln"> 123</span>
+<span class="ln"> 124</span>
+<span class="ln"> 125</span><span class="k">def</span> check_provider_url(url: <span class="b">str</span>, configured_url: <span class="b">str</span>):
+<span class="ln"> 126</span>    parts = urlsplit(url)
+<span class="ln"> 127</span>    is_local = parts.hostname <span class="k">in</span> (<span class="s">&quot;localhost&quot;</span>, <span class="s">&quot;127.0.0.1&quot;</span>, <span class="s">&quot;::1&quot;</span>)
+<span class="ln"> 128</span>    <span class="k">if</span> parts.scheme <span class="k">not</span> <span class="k">in</span> (<span class="s">&quot;http&quot;</span>, <span class="s">&quot;https&quot;</span>) <span class="k">or</span> <span class="k">not</span> parts.hostname:
+<span class="ln"> 129</span>        <span class="k">return</span> <span class="s">&quot;The provider URL must start with https://.&quot;</span>
+<span class="ln"> 130</span>    <span class="k">if</span> parts.scheme == <span class="s">&quot;http&quot;</span> <span class="k">and</span> <span class="k">not</span> is_local:
+<span class="ln"> 131</span>        <span class="k">return</span> <span class="s">&quot;A remote provider URL must use https://, or the key would travel unencrypted.&quot;</span>
+<span class="ln"> 132</span>    <span class="k">if</span> url <span class="k">not</span> <span class="k">in</span> (OPENROUTER_URL, configured_url.rstrip(<span class="s">&quot;/&quot;</span>)) <span class="k">and</span> <span class="k">not</span> ALLOW_ANY_PROVIDER:
+<span class="ln"> 133</span>        <span class="k">return</span> (<span class="s">&quot;Only OpenRouter or the provider from .env is allowed from the page. &quot;</span>
+<span class="ln"> 134</span>                <span class="s">&quot;Start the server with AGENT_ALLOW_ANY_PROVIDER=1 to use another endpoint.&quot;</span>)
+<span class="ln"> 135</span>    <span class="k">return</span> <span class="k">None</span>
+<span class="ln"> 136</span>
 <span class="ln"> 137</span>
-<span class="ln"> 138</span>    <span class="k">def</span> handle_chat(self) -&gt; <span class="k">None</span>:
-<span class="ln"> 139</span>        body = self.read_json_body()
-<span class="ln"> 140</span>        text = <span class="b">str</span>(body.get(<span class="s">&quot;text&quot;</span>, <span class="s">&quot;&quot;</span>)).strip()
-<span class="ln"> 141</span>        <span class="k">if</span> text == <span class="s">&quot;&quot;</span>:
-<span class="ln"> 142</span>            self.send_json(<span class="n">400</span>, {<span class="s">&quot;error&quot;</span>: <span class="s">&quot;text is required&quot;</span>})
-<span class="ln"> 143</span>            <span class="k">return</span>
-<span class="ln"> 144</span>        <span class="k">if</span> <span class="b">isinstance</span>(body.get(<span class="s">&quot;settings&quot;</span>), <span class="b">dict</span>):
-<span class="ln"> 145</span>            self.apply_setting_overrides(body[<span class="s">&quot;settings&quot;</span>])
-<span class="ln"> 146</span>        <span class="k">if</span> <span class="k">not</span> run_lock.acquire(blocking=<span class="k">False</span>):
-<span class="ln"> 147</span>            self.send_json(<span class="n">409</span>, {<span class="s">&quot;error&quot;</span>: <span class="s">&quot;the agent is still working on the previous message&quot;</span>})
-<span class="ln"> 148</span>            <span class="k">return</span>
+<span class="ln"> 138</span><span class="k">class</span> Handler(BaseHTTPRequestHandler):
+<span class="ln"> 139</span>    <span class="c"># ----- helpers ---------------------------------------------------------</span>
+<span class="ln"> 140</span>
+<span class="ln"> 141</span>    <span class="k">def</span> send_json(self, status: <span class="b">int</span>, payload: <span class="b">dict</span>) -&gt; <span class="k">None</span>:
+<span class="ln"> 142</span>        body = <span class="b">json</span>.dumps(payload).encode(<span class="s">&quot;utf-8&quot;</span>)
+<span class="ln"> 143</span>        self.send_response(status)
+<span class="ln"> 144</span>        self.send_header(<span class="s">&quot;Content-Type&quot;</span>, <span class="s">&quot;application/json&quot;</span>)
+<span class="ln"> 145</span>        self.send_header(<span class="s">&quot;Content-Length&quot;</span>, <span class="b">str</span>(<span class="b">len</span>(body)))
+<span class="ln"> 146</span>        self.send_cors_headers()
+<span class="ln"> 147</span>        self.end_headers()
+<span class="ln"> 148</span>        self.wfile.write(body)
 <span class="ln"> 149</span>
-<span class="ln"> 150</span>        <span class="k">try</span>:
-<span class="ln"> 151</span>            self.send_response(<span class="n">200</span>)
-<span class="ln"> 152</span>            self.send_header(<span class="s">&quot;Content-Type&quot;</span>, <span class="s">&quot;text/event-stream&quot;</span>)
-<span class="ln"> 153</span>            self.send_header(<span class="s">&quot;Cache-Control&quot;</span>, <span class="s">&quot;no-cache&quot;</span>)
-<span class="ln"> 154</span>            self.send_header(<span class="s">&quot;X-Accel-Buffering&quot;</span>, <span class="s">&quot;no&quot;</span>)
-<span class="ln"> 155</span>            self.send_cors_headers()
-<span class="ln"> 156</span>            self.end_headers()
-<span class="ln"> 157</span>
-<span class="ln"> 158</span>            <span class="k">def</span> send_event(event: <span class="b">dict</span>) -&gt; <span class="k">None</span>:
-<span class="ln"> 159</span>                line = <span class="s">&quot;data: &quot;</span> + <span class="b">json</span>.dumps(event) + <span class="s">&quot;\n\n&quot;</span>
-<span class="ln"> 160</span>                self.wfile.write(line.encode(<span class="s">&quot;utf-8&quot;</span>))
-<span class="ln"> 161</span>                self.wfile.flush()
-<span class="ln"> 162</span>
-<span class="ln"> 163</span>            <span class="k">try</span>:
-<span class="ln"> 164</span>                agent.run(text, on_event=send_event)
-<span class="ln"> 165</span>            <span class="k">except</span> (BrokenPipeError, ConnectionResetError):
-<span class="ln"> 166</span>                <span class="k">pass</span>   <span class="c"># the browser tab was closed mid-run; nothing to send to</span>
-<span class="ln"> 167</span>            <span class="k">else</span>:
-<span class="ln"> 168</span>                send_event({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;done&quot;</span>, <span class="s">&quot;usage&quot;</span>: agent.total_usage, <span class="s">&quot;message_count&quot;</span>: <span class="b">len</span>(agent.messages)})
-<span class="ln"> 169</span>        <span class="k">finally</span>:
-<span class="ln"> 170</span>            run_lock.release()
-<span class="ln"> 171</span>
-<span class="ln"> 172</span>
-<span class="ln"> 173</span><span class="k">def</span> serve(the_agent, the_settings, host: <span class="b">str</span> = HOST, port: <span class="b">int</span> = PORT) -&gt; <span class="k">None</span>:
-<span class="ln"> 174</span>    <span class="d">&quot;&quot;&quot;Start the server around any Agent, real or fake, and block until Ctrl+C.&quot;&quot;&quot;</span>
-<span class="ln"> 175</span>    <span class="k">global</span> agent, settings
-<span class="ln"> 176</span>    agent = the_agent
-<span class="ln"> 177</span>    settings = the_settings
-<span class="ln"> 178</span>    server = ThreadingHTTPServer((host, port), Handler)
-<span class="ln"> 179</span>    <span class="b">print</span>(f&quot;Agent UI:   http://{host}:{port}&quot;)
-<span class="ln"> 180</span>    <span class="b">print</span>(f&quot;Model:      {settings.model} via {settings.base_url}&quot;)
-<span class="ln"> 181</span>    <span class="b">print</span>(f&quot;Workspace:  {settings.workspace}&quot;)
-<span class="ln"> 182</span>    <span class="b">print</span>(<span class="s">&quot;Press Ctrl+C to stop.&quot;</span>)
-<span class="ln"> 183</span>    <span class="k">try</span>:
-<span class="ln"> 184</span>        server.serve_forever()
-<span class="ln"> 185</span>    <span class="k">except</span> KeyboardInterrupt:
-<span class="ln"> 186</span>        <span class="b">print</span>(<span class="s">&quot;\nStopped.&quot;</span>)
-<span class="ln"> 187</span>
-<span class="ln"> 188</span>
-<span class="ln"> 189</span><span class="k">def</span> main() -&gt; <span class="k">None</span>:
-<span class="ln"> 190</span>    the_settings = load_settings()
-<span class="ln"> 191</span>    missing = the_settings.missing()
-<span class="ln"> 192</span>    <span class="k">if</span> missing:
-<span class="ln"> 193</span>        <span class="b">print</span>(f&quot;Warning: missing settings {<span class="s">&#x27;, &#x27;</span>.join(missing)}. The page will load but the model cannot be called.&quot;)
-<span class="ln"> 194</span>    serve(create_agent(the_settings), the_settings)
-<span class="ln"> 195</span>
-<span class="ln"> 196</span>
-<span class="ln"> 197</span><span class="k">if</span> __name__ == <span class="s">&quot;__main__&quot;</span>:
-<span class="ln"> 198</span>    main()</code></pre></figure></details>
+<span class="ln"> 150</span>    <span class="k">def</span> send_cors_headers(self) -&gt; <span class="k">None</span>:
+<span class="ln"> 151</span>        origin = self.headers.get(<span class="s">&quot;Origin&quot;</span>, <span class="s">&quot;&quot;</span>)
+<span class="ln"> 152</span>        <span class="k">if</span> origin <span class="k">in</span> ALLOWED_ORIGINS:
+<span class="ln"> 153</span>            self.send_header(<span class="s">&quot;Access-Control-Allow-Origin&quot;</span>, origin)
+<span class="ln"> 154</span>            self.send_header(<span class="s">&quot;Vary&quot;</span>, <span class="s">&quot;Origin&quot;</span>)
+<span class="ln"> 155</span>
+<span class="ln"> 156</span>    <span class="k">def</span> do_OPTIONS(self) -&gt; <span class="k">None</span>:
+<span class="ln"> 157</span>        <span class="d">&quot;&quot;&quot;The browser asks permission before a cross-origin POST. Answer it.&quot;&quot;&quot;</span>
+<span class="ln"> 158</span>        self.send_response(<span class="n">204</span>)
+<span class="ln"> 159</span>        self.send_cors_headers()
+<span class="ln"> 160</span>        self.send_header(<span class="s">&quot;Access-Control-Allow-Methods&quot;</span>, <span class="s">&quot;GET, POST, OPTIONS&quot;</span>)
+<span class="ln"> 161</span>        self.send_header(<span class="s">&quot;Access-Control-Allow-Headers&quot;</span>, <span class="s">&quot;Content-Type&quot;</span>)
+<span class="ln"> 162</span>        self.send_header(<span class="s">&quot;Access-Control-Max-Age&quot;</span>, <span class="s">&quot;600&quot;</span>)
+<span class="ln"> 163</span>        self.end_headers()
+<span class="ln"> 164</span>
+<span class="ln"> 165</span>    <span class="k">def</span> check_origin(self):
+<span class="ln"> 166</span>        <span class="d">&quot;&quot;&quot;Return a problem text if this request comes from a page we do not trust.
+<span class="ln"> 167</span>
+<span class="ln"> 168</span>        No Origin header means a non-browser client (curl, a script): allowed.
+<span class="ln"> 169</span>        Same site as this server: allowed. Listed origin: allowed. Else 403.
+<span class="ln"> 170</span>        &quot;&quot;&quot;</span>
+<span class="ln"> 171</span>        origin = self.headers.get(<span class="s">&quot;Origin&quot;</span>)
+<span class="ln"> 172</span>        <span class="k">if</span> origin <span class="k">is</span> <span class="k">None</span>:
+<span class="ln"> 173</span>            <span class="k">return</span> <span class="k">None</span>
+<span class="ln"> 174</span>        host = self.headers.get(<span class="s">&quot;Host&quot;</span>, <span class="s">&quot;&quot;</span>)
+<span class="ln"> 175</span>        <span class="k">if</span> urlsplit(origin).netloc == host <span class="k">or</span> origin <span class="k">in</span> ALLOWED_ORIGINS:
+<span class="ln"> 176</span>            <span class="k">return</span> <span class="k">None</span>
+<span class="ln"> 177</span>        <span class="k">return</span> f&quot;Requests from {origin} are not allowed. Add it to AGENT_ALLOWED_ORIGINS if it is yours.&quot;
+<span class="ln"> 178</span>
+<span class="ln"> 179</span>    <span class="k">def</span> read_json_object(self):
+<span class="ln"> 180</span>        <span class="d">&quot;&quot;&quot;Return (object, problem). The body must be a small JSON object.&quot;&quot;&quot;</span>
+<span class="ln"> 181</span>        content_type = self.headers.get(<span class="s">&quot;Content-Type&quot;</span>, <span class="s">&quot;&quot;</span>)
+<span class="ln"> 182</span>        <span class="k">if</span> <span class="k">not</span> content_type.startswith(<span class="s">&quot;application/json&quot;</span>):
+<span class="ln"> 183</span>            <span class="k">return</span> <span class="k">None</span>, <span class="s">&quot;Content-Type must be application/json.&quot;</span>
+<span class="ln"> 184</span>        <span class="k">try</span>:
+<span class="ln"> 185</span>            length = <span class="b">int</span>(self.headers.get(<span class="s">&quot;Content-Length&quot;</span>, <span class="s">&quot;0&quot;</span>))
+<span class="ln"> 186</span>        <span class="k">except</span> ValueError:
+<span class="ln"> 187</span>            <span class="k">return</span> <span class="k">None</span>, <span class="s">&quot;Content-Length is not a number.&quot;</span>
+<span class="ln"> 188</span>        <span class="k">if</span> length &gt; MAX_BODY_BYTES:
+<span class="ln"> 189</span>            <span class="k">return</span> <span class="k">None</span>, f&quot;The request body is too large (limit {MAX_BODY_BYTES} bytes).&quot;
+<span class="ln"> 190</span>        raw = self.rfile.read(length) <span class="k">if</span> length &gt; <span class="n">0</span> <span class="k">else</span> <span class="s">b&quot;{}&quot;</span>
+<span class="ln"> 191</span>        <span class="k">try</span>:
+<span class="ln"> 192</span>            body = <span class="b">json</span>.loads(raw.decode(<span class="s">&quot;utf-8&quot;</span>))
+<span class="ln"> 193</span>        <span class="k">except</span> (<span class="b">json</span>.JSONDecodeError, UnicodeDecodeError):
+<span class="ln"> 194</span>            <span class="k">return</span> <span class="k">None</span>, <span class="s">&quot;The request body is not valid JSON.&quot;</span>
+<span class="ln"> 195</span>        <span class="k">if</span> <span class="k">not</span> <span class="b">isinstance</span>(body, <span class="b">dict</span>):
+<span class="ln"> 196</span>            <span class="k">return</span> <span class="k">None</span>, <span class="s">&quot;The request body must be a JSON object.&quot;</span>
+<span class="ln"> 197</span>        <span class="k">return</span> body, <span class="k">None</span>
+<span class="ln"> 198</span>
+<span class="ln"> 199</span>    <span class="k">def</span> log_message(self, format, *args):  <span class="c"># noqa: A002 - quieter default logging</span>
+<span class="ln"> 200</span>        sys.stderr.write(<span class="s">&quot;  http: &quot;</span> + (format % args) + <span class="s">&quot;\n&quot;</span>)
+<span class="ln"> 201</span>
+<span class="ln"> 202</span>    <span class="c"># ----- routes ------------------------------------------------------------</span>
+<span class="ln"> 203</span>
+<span class="ln"> 204</span>    <span class="k">def</span> do_GET(self) -&gt; <span class="k">None</span>:
+<span class="ln"> 205</span>        <span class="k">if</span> self.path == <span class="s">&quot;/&quot;</span> <span class="k">or</span> self.path.startswith(<span class="s">&quot;/?&quot;</span>):
+<span class="ln"> 206</span>            self.serve_file(<span class="s">&quot;index.html&quot;</span>, <span class="s">&quot;text/html; charset=utf-8&quot;</span>)
+<span class="ln"> 207</span>        <span class="k">elif</span> self.path == <span class="s">&quot;/state&quot;</span>:
+<span class="ln"> 208</span>            self.send_json(<span class="n">200</span>, {
+<span class="ln"> 209</span>                <span class="s">&quot;messages&quot;</span>: agent.messages,
+<span class="ln"> 210</span>                <span class="s">&quot;usage&quot;</span>: agent.total_usage,
+<span class="ln"> 211</span>                <span class="s">&quot;model&quot;</span>: settings.model,
+<span class="ln"> 212</span>                <span class="s">&quot;base_url&quot;</span>: settings.base_url,
+<span class="ln"> 213</span>                <span class="s">&quot;workspace&quot;</span>: settings.workspace,
+<span class="ln"> 214</span>                <span class="s">&quot;tools&quot;</span>: agent.tools.names(),
+<span class="ln"> 215</span>                <span class="s">&quot;missing&quot;</span>: settings.missing(),
+<span class="ln"> 216</span>                <span class="s">&quot;busy&quot;</span>: run_lock.locked(),
+<span class="ln"> 217</span>            })
+<span class="ln"> 218</span>        <span class="k">else</span>:
+<span class="ln"> 219</span>            self.send_json(<span class="n">404</span>, {<span class="s">&quot;error&quot;</span>: <span class="s">&quot;not found&quot;</span>})
+<span class="ln"> 220</span>
+<span class="ln"> 221</span>    <span class="k">def</span> do_POST(self) -&gt; <span class="k">None</span>:
+<span class="ln"> 222</span>        problem = self.check_origin()
+<span class="ln"> 223</span>        <span class="k">if</span> problem:
+<span class="ln"> 224</span>            self.send_json(<span class="n">403</span>, {<span class="s">&quot;error&quot;</span>: problem})
+<span class="ln"> 225</span>        <span class="k">elif</span> self.path == <span class="s">&quot;/reset&quot;</span>:
+<span class="ln"> 226</span>            self.handle_reset()
+<span class="ln"> 227</span>        <span class="k">elif</span> self.path == <span class="s">&quot;/chat&quot;</span>:
+<span class="ln"> 228</span>            self.handle_chat()
+<span class="ln"> 229</span>        <span class="k">else</span>:
+<span class="ln"> 230</span>            self.send_json(<span class="n">404</span>, {<span class="s">&quot;error&quot;</span>: <span class="s">&quot;not found&quot;</span>})
+<span class="ln"> 231</span>
+<span class="ln"> 232</span>    <span class="k">def</span> serve_file(self, name: <span class="b">str</span>, content_type: <span class="b">str</span>) -&gt; <span class="k">None</span>:
+<span class="ln"> 233</span>        path = os.path.join(WEB_DIR, name)
+<span class="ln"> 234</span>        <span class="k">with</span> <span class="b">open</span>(path, <span class="s">&quot;rb&quot;</span>) <span class="k">as</span> file:
+<span class="ln"> 235</span>            body = file.read()
+<span class="ln"> 236</span>        self.send_response(<span class="n">200</span>)
+<span class="ln"> 237</span>        self.send_header(<span class="s">&quot;Content-Type&quot;</span>, content_type)
+<span class="ln"> 238</span>        self.send_header(<span class="s">&quot;Content-Length&quot;</span>, <span class="b">str</span>(<span class="b">len</span>(body)))
+<span class="ln"> 239</span>        self.send_cors_headers()
+<span class="ln"> 240</span>        self.end_headers()
+<span class="ln"> 241</span>        self.wfile.write(body)
+<span class="ln"> 242</span>
+<span class="ln"> 243</span>    <span class="k">def</span> handle_reset(self) -&gt; <span class="k">None</span>:
+<span class="ln"> 244</span>        <span class="k">if</span> <span class="k">not</span> run_lock.acquire(blocking=<span class="k">False</span>):
+<span class="ln"> 245</span>            self.send_json(<span class="n">409</span>, {<span class="s">&quot;error&quot;</span>: <span class="s">&quot;The agent is still working. Wait for it to finish, then reset.&quot;</span>})
+<span class="ln"> 246</span>            <span class="k">return</span>
+<span class="ln"> 247</span>        <span class="k">try</span>:
+<span class="ln"> 248</span>            agent.reset()
+<span class="ln"> 249</span>            self.send_json(<span class="n">200</span>, {<span class="s">&quot;ok&quot;</span>: <span class="k">True</span>})
+<span class="ln"> 250</span>        <span class="k">finally</span>:
+<span class="ln"> 251</span>            run_lock.release()
+<span class="ln"> 252</span>
+<span class="ln"> 253</span>    <span class="k">def</span> handle_chat(self) -&gt; <span class="k">None</span>:
+<span class="ln"> 254</span>        <span class="k">global</span> settings
+<span class="ln"> 255</span>        body, problem = self.read_json_object()
+<span class="ln"> 256</span>        <span class="k">if</span> problem:
+<span class="ln"> 257</span>            self.send_json(<span class="n">400</span>, {<span class="s">&quot;error&quot;</span>: problem})
+<span class="ln"> 258</span>            <span class="k">return</span>
+<span class="ln"> 259</span>        text = body.get(<span class="s">&quot;text&quot;</span>)
+<span class="ln"> 260</span>        <span class="k">if</span> <span class="k">not</span> <span class="b">isinstance</span>(text, <span class="b">str</span>) <span class="k">or</span> text.strip() == <span class="s">&quot;&quot;</span>:
+<span class="ln"> 261</span>            self.send_json(<span class="n">400</span>, {<span class="s">&quot;error&quot;</span>: <span class="s">&quot;text must be a non-empty string.&quot;</span>})
+<span class="ln"> 262</span>            <span class="k">return</span>
+<span class="ln"> 263</span>        <span class="k">if</span> <span class="b">len</span>(text) &gt; MAX_TEXT_CHARS:
+<span class="ln"> 264</span>            self.send_json(<span class="n">400</span>, {<span class="s">&quot;error&quot;</span>: f&quot;text is too long (limit {MAX_TEXT_CHARS} characters).&quot;})
+<span class="ln"> 265</span>            <span class="k">return</span>
+<span class="ln"> 266</span>        overrides = body.get(<span class="s">&quot;settings&quot;</span>) <span class="k">if</span> <span class="b">isinstance</span>(body.get(<span class="s">&quot;settings&quot;</span>), <span class="b">dict</span>) <span class="k">else</span> {}
+<span class="ln"> 267</span>
+<span class="ln"> 268</span>        <span class="c"># Everything below happens with the lock held: the run&#x27;s settings</span>
+<span class="ln"> 269</span>        <span class="c"># cannot be changed by another request until this one is over.</span>
+<span class="ln"> 270</span>        <span class="k">if</span> <span class="k">not</span> run_lock.acquire(blocking=<span class="k">False</span>):
+<span class="ln"> 271</span>            self.send_json(<span class="n">409</span>, {<span class="s">&quot;error&quot;</span>: <span class="s">&quot;The agent is still working on the previous message.&quot;</span>})
+<span class="ln"> 272</span>            <span class="k">return</span>
+<span class="ln"> 273</span>        <span class="k">try</span>:
+<span class="ln"> 274</span>            run_settings, problem = settings_for_run(settings, overrides)
+<span class="ln"> 275</span>            <span class="k">if</span> problem:
+<span class="ln"> 276</span>                self.send_json(<span class="n">400</span>, {<span class="s">&quot;error&quot;</span>: problem})
+<span class="ln"> 277</span>                <span class="k">return</span>
+<span class="ln"> 278</span>
+<span class="ln"> 279</span>            self.send_response(<span class="n">200</span>)
+<span class="ln"> 280</span>            self.send_header(<span class="s">&quot;Content-Type&quot;</span>, <span class="s">&quot;text/event-stream&quot;</span>)
+<span class="ln"> 281</span>            self.send_header(<span class="s">&quot;Cache-Control&quot;</span>, <span class="s">&quot;no-cache&quot;</span>)
+<span class="ln"> 282</span>            self.send_header(<span class="s">&quot;X-Accel-Buffering&quot;</span>, <span class="s">&quot;no&quot;</span>)
+<span class="ln"> 283</span>            self.send_cors_headers()
+<span class="ln"> 284</span>            self.end_headers()
+<span class="ln"> 285</span>
+<span class="ln"> 286</span>            stream = EventStream(self.wfile)
+<span class="ln"> 287</span>            <span class="c"># A fake model (tests, the offline chapters) has no settings and is left alone.</span>
+<span class="ln"> 288</span>            uses_real_model = hasattr(agent.llm, <span class="s">&quot;settings&quot;</span>)
+<span class="ln"> 289</span>            <span class="k">if</span> uses_real_model:
+<span class="ln"> 290</span>                agent.llm = make_llm(run_settings)
+<span class="ln"> 291</span>            <span class="k">try</span>:
+<span class="ln"> 292</span>                agent.run(text.strip(), on_event=stream.send)
+<span class="ln"> 293</span>            <span class="k">except</span> Exception <span class="k">as</span> error:  <span class="c"># noqa: BLE001 - report, never die silently</span>
+<span class="ln"> 294</span>                sys.stderr.write(f&quot;  unexpected error in agent.run: {type(error).__name__}: {error}\n&quot;)
+<span class="ln"> 295</span>                stream.send({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;error&quot;</span>, <span class="s">&quot;text&quot;</span>: f&quot;Unexpected error: {type(error).__name__}: {error}&quot;})
+<span class="ln"> 296</span>            <span class="k">finally</span>:
+<span class="ln"> 297</span>                <span class="k">if</span> uses_real_model:
+<span class="ln"> 298</span>                    agent.llm = make_llm(settings)
+<span class="ln"> 299</span>            <span class="k">if</span> <span class="k">not</span> stream.saw_error:
+<span class="ln"> 300</span>                settings = run_settings          <span class="c"># the overrides proved themselves; keep them</span>
+<span class="ln"> 301</span>            stream.send({<span class="s">&quot;type&quot;</span>: <span class="s">&quot;done&quot;</span>, <span class="s">&quot;usage&quot;</span>: agent.total_usage, <span class="s">&quot;message_count&quot;</span>: <span class="b">len</span>(agent.messages),
+<span class="ln"> 302</span>                         <span class="s">&quot;model&quot;</span>: settings.model})
+<span class="ln"> 303</span>        <span class="k">finally</span>:
+<span class="ln"> 304</span>            run_lock.release()
+<span class="ln"> 305</span>
+<span class="ln"> 306</span>
+<span class="ln"> 307</span><span class="k">def</span> serve(the_agent, the_settings, host: <span class="b">str</span> = HOST, port: <span class="b">int</span> = PORT) -&gt; <span class="k">None</span>:
+<span class="ln"> 308</span>    <span class="d">&quot;&quot;&quot;Start the server around any Agent, real or fake, and block until Ctrl+C.&quot;&quot;&quot;</span>
+<span class="ln"> 309</span>    <span class="k">global</span> agent, settings
+<span class="ln"> 310</span>    agent = the_agent
+<span class="ln"> 311</span>    settings = the_settings
+<span class="ln"> 312</span>    server = ThreadingHTTPServer((host, port), Handler)
+<span class="ln"> 313</span>    <span class="b">print</span>(f&quot;Agent UI:   http://{host}:{port}&quot;)
+<span class="ln"> 314</span>    <span class="b">print</span>(f&quot;Model:      {settings.model} via {settings.base_url}&quot;)
+<span class="ln"> 315</span>    <span class="b">print</span>(f&quot;Workspace:  {settings.workspace}&quot;)
+<span class="ln"> 316</span>    <span class="b">print</span>(<span class="s">&quot;Press Ctrl+C to stop.&quot;</span>)
+<span class="ln"> 317</span>    <span class="k">try</span>:
+<span class="ln"> 318</span>        server.serve_forever()
+<span class="ln"> 319</span>    <span class="k">except</span> KeyboardInterrupt:
+<span class="ln"> 320</span>        <span class="b">print</span>(<span class="s">&quot;\nStopped.&quot;</span>)
+<span class="ln"> 321</span>
+<span class="ln"> 322</span>
+<span class="ln"> 323</span><span class="k">def</span> main() -&gt; <span class="k">None</span>:
+<span class="ln"> 324</span>    the_settings = load_settings()
+<span class="ln"> 325</span>    missing = the_settings.missing()
+<span class="ln"> 326</span>    <span class="k">if</span> missing:
+<span class="ln"> 327</span>        <span class="b">print</span>(f&quot;Warning: missing settings {<span class="s">&#x27;, &#x27;</span>.join(missing)}. The page will load but the model cannot be called.&quot;)
+<span class="ln"> 328</span>    serve(create_agent(the_settings), the_settings)
+<span class="ln"> 329</span>
+<span class="ln"> 330</span>
+<span class="ln"> 331</span><span class="k">if</span> __name__ == <span class="s">&quot;__main__&quot;</span>:
+<span class="ln"> 332</span>    main()</code></pre></figure></details>
 <details><summary>The offline demo: course/ch07_web_window.py</summary><figure class="code"><figcaption><span class="path">course/ch07_web_window.py</span><span class="hint">real file, embedded at build time</span></figcaption><pre><code><span class="ln">   1</span><span class="d">&quot;&quot;&quot;
 <span class="ln">   2</span>Chapter 7 - The web window. Same loop, events go to a browser instead.
 <span class="ln">   3</span>
@@ -2070,7 +2437,7 @@ python3 -m agent.server                       # chat in the browser at http://12
 <span class="ln">  69</span>serve(agent, settings)</code></pre></figure></details>
 <div class="cmd">python3 course/ch07_web_window.py      # opens the real page with a scripted model, no key needed
 python3 -m agent.server               # the same page with the real model from .env</div>
-<div class="note"><h4>Settings inside the page</h4>The Settings button lets you point the page at a different agent server, and paste a key, base URL and model that override <code>.env</code> for this conversation. Those values live in your browser and in the server's memory only; nothing is written to disk.</div>
+<div class="note"><h4>Settings inside the page</h4>The Settings button lets you point the page at a different agent server, and enter a key, provider URL and model that override <code>.env</code> for the next message. The server URL, provider URL and model are remembered by your browser; the key is held in the page's memory only and is gone when the tab closes. The overrides become the server's active settings only after a message succeeds with them, so a typo in the model name gives you one clear error and nothing else changes. <b>Use server defaults</b> clears all of it. If a run never ends, <b>Stop</b> makes the page stop listening; the server finishes the turn on its own.</div>
 
 <!-- ===================================================== CH 8 ============== -->
 <h2 id="ch8">8 · Context: what the model sees first, and what to do when the list gets long</h2>
@@ -2324,7 +2691,7 @@ python3 -m agent.server               # the same page with the real model from .
 <tr><td>6</td><td>"Stopped after N steps without a final answer"</td><td>The model loops on the same tool</td><td>The brake. Read the Messages tab: what did it keep asking for? Usually a tool result it could not act on.</td></tr>
 <tr><td>7</td><td>Answers get vague; HTTP 400 context length</td><td>Huge tool outputs or a very long session</td><td><code>truncate_output</code> and compaction. Check <code>AGENT_CONTEXT_WINDOW</code> matches the model.</td></tr>
 <tr><td>8</td><td>The agent hangs on a command</td><td>The command waited for input</td><td>The timeout kills it and reports it. Tell the model to pass <code>timeout_seconds</code> or avoid interactive commands.</td></tr>
-<tr><td>9</td><td>The answer is "Error: HTTP 401 / 402 / 429 / 404 …"</td><td>Key, credits, rate limit, model id</td><td><code>explain_http_error</code> in <code>agent/llm.py</code> already says what to do. Check <code>.env</code>, then the provider dashboard.</td></tr>
+<tr><td>9</td><td>The answer is "Error: HTTP 401 / 402 / 429 / 404 …"</td><td>Key, credits, rate limit, model id</td><td><code>explain_http_error</code> in <code>agent/llm.py</code> already says what to do. The failed turn is rolled back, so the next message starts clean. Check <code>.env</code> or the page's Settings (Use server defaults clears a bad model name), then the provider dashboard.</td></tr>
 <tr><td>10</td><td>The model describes what it would do instead of doing it</td><td>Tools not sent, model without tool support, or a weak description</td><td>Confirm <code>tools</code> is in the payload; pick a model that lists <code>tools</code> in its supported parameters; write descriptions that say <em>when</em> to use the tool.</td></tr>
 <tr><td>11</td><td>HTTP 400 mentioning tool_call_id or message order</td><td>The list is malformed: a tool message with no request, or a user message before all requests were answered</td><td>Run <code>check_message_order(agent.messages)</code> from <code>agent/debug.py</code>. It names the bad index.</td></tr>
 <tr><td>12</td><td>HTTP 400 from a <em>different</em> provider after switching models</td><td>Provider-specific fields (reasoning, refusal) sent back in the history</td><td><code>clean_assistant_message</code> keeps only role, content and tool_calls.</td></tr>
@@ -2697,11 +3064,11 @@ python3 -m agent.server               # the same page with the real model from .
 <tr><th></th><th>Static site (free plan)</th><th>Sandboxed agent (Workers Paid, $5/month)</th></tr>
 <tr><td>What is hosted</td><td>This course and the chat page</td><td>This course, the chat page, and the same Python package running in a Linux container per browser session</td></tr>
 <tr><td>Where the agent runs</td><td>On your computer: <code>python3 -m agent.server</code>, then set the Agent server URL in the page's Settings to <code>http://127.0.0.1:8765</code> (Chrome or Firefox)</td><td>In the cloud. The Worker copies <code>agent/</code> into the sandbox and runs the exact command above</td></tr>
-<tr><td>Where the key lives</td><td>In your <code>.env</code>, or pasted into the page's Settings</td><td>Pasted into the page's Settings; sent to the sandbox with each message, held in memory only</td></tr>
+<tr><td>Where the key lives</td><td>In your <code>.env</code>, or typed into the page's Settings (page memory only, never saved)</td><td>Typed into the page's Settings; sent to the sandbox with each message, held in memory only</td></tr>
 <tr><td>Deploy command</td><td><code>npm run deploy:site</code> in <code>deploy/cloudflare</code></td><td><code>npm run deploy:sandbox</code> in <code>deploy/cloudflare</code></td></tr>
 </table></div>
-<div class="warn"><h4>Two honest limits</h4>
-The cloud sandbox sleeps after 15 idle minutes and forgets its files and conversation; that is what makes it cheap. And a coding agent runs whatever commands the model chooses, so the hosted page is behind a password. On your own machine the workspace lock is a convenience, not a security boundary: the commands run as you.</div>
+<div class="warn"><h4>Three honest limits</h4>
+The cloud sandbox sleeps after 15 idle minutes and forgets its files and conversation; that is what makes it cheap, and its workspace starts empty apart from a README. A coding agent runs whatever commands the model chooses, so the hosted chat page is behind a password and, with no password configured, refuses to serve at all. And on your own machine <code>run_command</code> is a real shell running as you: the workspace folder confines the four file tools, not the shell. The blueprint gives that shell a minimal environment without your API key, a clamped timeout that kills the whole process group, and capped output; the real boundary on the hosted version is Cloudflare's container, and a local operating-system sandbox is outside this blueprint's scope.</div>
 
 <!-- ===================================================== GLOSSARY ========== -->
 <h2 id="glossary">Glossary</h2>

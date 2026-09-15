@@ -37,19 +37,29 @@ def create_agent(settings: Settings | None = None) -> Agent:
 
     workspace = Workspace(settings.workspace)
     registry = ToolRegistry(build_tools(workspace))
-
-    def llm(messages: list[dict], tool_schemas: list[dict]):
-        """The loop calls this. It only knows: messages in, reply out."""
-        return chat(messages, tool_schemas, settings)
-
     system_prompt = build_system_prompt(workspace)
     return Agent(
-        llm=llm,
+        llm=make_llm(settings),
         tools=registry,
         system_prompt=system_prompt,
         max_steps=settings.max_steps,
         context_window=settings.context_window,
     )
+
+
+def make_llm(settings: Settings):
+    """Bind chat() to one Settings object.
+
+    The loop calls the result with (messages, tool_schemas) and never sees
+    the key, the URL or the model name. To run with different settings,
+    make a new llm function; the old Settings object is never changed.
+    """
+
+    def llm(messages: list[dict], tool_schemas: list[dict]):
+        return chat(messages, tool_schemas, settings)
+
+    llm.settings = settings   # lets server.py tell a real model apart from a fake one
+    return llm
 
 
 def build_system_prompt(workspace: Workspace) -> str:
@@ -86,4 +96,5 @@ __all__ = [
     "chat",
     "create_agent",
     "load_settings",
+    "make_llm",
 ]

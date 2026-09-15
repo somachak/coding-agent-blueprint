@@ -2,15 +2,29 @@
 workspace.py - the five coding tools, locked to one folder.
 
 A coding agent needs to look around, read, write, edit and run things.
-Every one of those actions goes through a Workspace object, and every
-path is checked so the agent cannot wander outside its root folder.
+Every one of those actions goes through a Workspace object. The four FILE
+tools check every path so the model cannot read or write outside the root
+folder. The SHELL tool is different, and honesty matters here:
+
+    run_command starts a real shell as YOU, with your permissions. Its
+    working directory is the workspace, but a shell can `cd ..` or read
+    any file you can read. The workspace is a convenience for the file
+    tools, not a security boundary for the shell.
+
+What this file does about that: the command gets a minimal environment
+(no API keys), a clamped timeout, its whole process group is killed on
+timeout, and captured output is capped. A real boundary needs an
+operating-system sandbox: on the hosted version that is Cloudflare's
+container; on your own machine it is out of this blueprint's scope.
 
 Each tool returns TEXT. The model reads that text and decides what to do
 next. Errors are also text (see tools.py for why).
 """
 
 import os
+import signal
 import subprocess
+import tempfile
 
 from .tools import Tool
 
@@ -18,6 +32,10 @@ from .tools import Tool
 # context window and hide the useful part, so we keep the head and the tail.
 MAX_OUTPUT_CHARS = 12_000
 MAX_LIST_ENTRIES = 300
+MAX_WRITE_CHARS = 2_000_000          # one write_file call; bigger is almost certainly a mistake
+MAX_INSTRUCTIONS_CHARS = 20_000      # AGENTS.md is a note, not a manual
+MAX_COMMAND_SECONDS = 120            # the longest any single command may run
+MAX_CAPTURE_BYTES = 200_000          # read at most this much of a command's output into memory
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", ".wrangler"}
 
 
@@ -84,6 +102,10 @@ class Workspace:
 
     def write_file(self, path: str, content: str) -> str:
         """Create or completely replace a file."""
+        if not isinstance(content, str):
+            return "Error: content must be text."
+        if len(content) > MAX_WRITE_CHARS:
+            return f"Error: content is {len(content)} characters; the limit is {MAX_WRITE_CHARS}. Write the file in parts."
         full = self.safe_path(path)
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "w", encoding="utf-8") as file:
@@ -113,39 +135,111 @@ class Workspace:
         return f"Edited {path}: replaced {len(old_text)} characters with {len(new_text)}."
 
     def run_command(self, command: str, timeout_seconds: int = 60) -> str:
-        """Run a shell command inside the workspace and return its output.
+        """Run a shell command with the workspace as its current directory.
 
-        stdout and stderr are both captured, the exit code is reported, and a
-        timeout stops runaway commands. The command runs with the same rights
-        as you, so the folder lock is a convenience, not a security boundary.
+        Output and exit code come back as text. Three guards, all visible:
+          - the command sees a MINIMAL environment (see minimal_environment),
+            so it cannot read the model API key;
+          - the timeout is clamped to MAX_COMMAND_SECONDS, and on timeout the
+            whole process group is killed, not just the shell;
+          - output is captured to temporary files and only the first
+            MAX_CAPTURE_BYTES are read back, so a runaway command cannot
+            fill memory.
+        None of this stops the shell from leaving the folder. See the note
+        at the top of this file.
         """
-        try:
-            completed = subprocess.run(
+        if not isinstance(command, str) or command.strip() == "":
+            return "Error: command must be a non-empty string."
+        timeout_seconds = clamp_timeout(timeout_seconds)
+
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=self.root,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                env=minimal_environment(self.root),
+                start_new_session=True,   # the shell becomes a group leader, so we can kill the whole group
             )
-        except subprocess.TimeoutExpired:
-            return f"Error: the command did not finish within {timeout_seconds} seconds and was killed."
-        output = completed.stdout
-        if completed.stderr:
-            output = output + ("\n[stderr]\n" if output else "[stderr]\n") + completed.stderr
+            timed_out = False
+            try:
+                process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            stdout = read_captured(stdout_file)
+            stderr = read_captured(stderr_file)
+
+        output = stdout
+        if stderr:
+            output = output + ("\n[stderr]\n" if output else "[stderr]\n") + stderr
         if output.strip() == "":
             output = "(no output)"
-        return truncate_output(f"exit code {completed.returncode}\n{output}")
+        if timed_out:
+            return truncate_output(
+                f"Error: the command did not finish within {timeout_seconds} seconds and was killed.\n"
+                f"Output before the kill:\n{output}"
+            )
+        return truncate_output(f"exit code {process.returncode}\n{output}")
 
     # ----- project memory ----------------------------------------------------
 
     def read_instructions(self) -> str:
-        """Return the text of AGENTS.md in the workspace, or '' if there is none."""
-        path = os.path.join(self.root, "AGENTS.md")
+        """Return the text of AGENTS.md in the workspace, or '' if there is none.
+
+        Goes through safe_path like every other read, so a symlink named
+        AGENTS.md that points outside the workspace is ignored, and the
+        text is capped so a huge file cannot swamp the system prompt.
+        """
+        try:
+            path = self.safe_path("AGENTS.md")
+        except ValueError:
+            return ""
         if not os.path.isfile(path):
             return ""
-        with open(path, encoding="utf-8") as file:
-            return file.read().strip()
+        with open(path, encoding="utf-8", errors="replace") as file:
+            text = file.read(MAX_INSTRUCTIONS_CHARS + 1)
+        if len(text) > MAX_INSTRUCTIONS_CHARS:
+            text = text[:MAX_INSTRUCTIONS_CHARS] + "\n[AGENTS.md was cut here: keep it short]"
+        return text.strip()
+
+
+def clamp_timeout(value) -> int:
+    """Turn whatever the model sent into a whole number of seconds within limits."""
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        seconds = 60
+    return max(1, min(seconds, MAX_COMMAND_SECONDS))
+
+
+def minimal_environment(home: str) -> dict:
+    """The only environment variables a command gets.
+
+    Notably absent: LLM_API_KEY and everything else from .env. A command the
+    model wrote must never be able to print the key. HOME points at the
+    workspace so tools that write config files stay inside it by default.
+    """
+    return {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": home,
+        "LANG": "C.UTF-8",
+        "TERM": "dumb",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+
+def read_captured(file) -> str:
+    """Read at most MAX_CAPTURE_BYTES from a temporary output file."""
+    file.seek(0)
+    data = file.read(MAX_CAPTURE_BYTES + 1)
+    text = data[:MAX_CAPTURE_BYTES].decode("utf-8", errors="replace")
+    if len(data) > MAX_CAPTURE_BYTES:
+        text += f"\n... [output beyond {MAX_CAPTURE_BYTES} bytes was not captured] ..."
+    return text
 
 
 def truncate_output(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
@@ -223,8 +317,9 @@ def build_tools(workspace: Workspace) -> list[Tool]:
         Tool(
             name="run_command",
             description=(
-                "Run a shell command inside the workspace (for example 'python3 app.py' or 'ls -la') "
-                "and return its output and exit code."
+                "Run a shell command with the workspace as the current directory (for example "
+                "'python3 app.py' or 'ls -la') and return its output and exit code. Commands are "
+                f"killed after timeout_seconds (maximum {MAX_COMMAND_SECONDS})."
             ),
             parameters={
                 "type": "object",

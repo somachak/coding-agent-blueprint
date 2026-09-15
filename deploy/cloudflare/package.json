@@ -3,6 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "build": "python3 ../../docs/build_site.py && python3 bundle.py",
     "deploy:site": "wrangler deploy -c wrangler.static.jsonc",
     "deploy:sandbox": "wrangler deploy -c wrangler.jsonc"
   },

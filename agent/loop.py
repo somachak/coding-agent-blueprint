@@ -15,7 +15,23 @@ Events
 ------
 The loop reports what it is doing by calling `on_event(event)` with a
 plain dictionary. The terminal prints them, the web page streams them,
-your own app can log them. The loop itself never prints.
+your own app can log them. The loop itself never prints. The event types:
+
+    user          the message that started this turn
+    compaction    old messages were shrunk to fit the window
+    model_call    about to ask the model (step number, message count)
+    model_reply   the model answered (did it ask for tools? how many?)
+    tool_call     one tool is about to run (name, arguments as JSON text)
+    tool_result   what that tool returned (text)
+    answer        the final text; the turn is over
+    error         something failed; the text says what and what was done
+
+A turn either finishes or is rolled back
+----------------------------------------
+If the model call fails (bad key, bad model name, network), the messages
+added during this turn are removed again, so the list never holds a
+half-finished turn. The next message starts from a clean state. Work the
+tools already did on disk is NOT undone; the error event says so.
 """
 
 from typing import Callable
@@ -27,6 +43,9 @@ from .tools import ToolRegistry
 Event = dict
 EventHandler = Callable[[Event], None]
 LLMFunction = Callable[[list[dict], list[dict]], ModelReply]
+
+# More than this many tool calls in ONE reply is a model misbehaving, not a plan.
+MAX_TOOL_CALLS_PER_REPLY = 20
 
 
 def no_op(event: Event) -> None:
@@ -55,7 +74,8 @@ class Agent:
         Returns the answer text. Everything that happened on the way is
         reported through on_event.
         """
-        self.messages.append({"role": "user", "content": user_text})
+        user_message = {"role": "user", "content": user_text}
+        self.messages.append(user_message)
         on_event({"type": "user", "text": user_text})
 
         for step in range(1, self.max_steps + 1):
@@ -67,7 +87,13 @@ class Agent:
             try:
                 reply = self.llm(self.messages, self.tools.schemas())
             except LLMError as error:
-                on_event({"type": "error", "step": step, "text": str(error)})
+                removed = self._roll_back(user_message)
+                on_event({
+                    "type": "error",
+                    "step": step,
+                    "text": f"{error}\nThis message was removed from the conversation ({removed} messages rolled back); "
+                            "files the tools already changed stay changed.",
+                })
                 return f"Error: {error}"
 
             self._add_usage(reply.usage)
@@ -89,12 +115,20 @@ class Agent:
                 return answer
 
             # ---- 2. ACT and 3. OBSERVE, once per requested call ------------
-            for call in tool_calls:
+            cut_off = reply.finish_reason == "length"   # the reply hit the output limit
+            for number, call in enumerate(tool_calls, start=1):
                 name = call["function"]["name"]
                 arguments_json = call["function"]["arguments"]
                 on_event({"type": "tool_call", "step": step, "id": call["id"], "name": name, "arguments": arguments_json})
 
-                result = self.tools.run(name, arguments_json)
+                if cut_off:
+                    result = ("Error: your reply was cut off by the output limit, so these arguments may be "
+                              "incomplete. The tool was not run. Re-issue the call with complete arguments.")
+                elif number > MAX_TOOL_CALLS_PER_REPLY:
+                    result = (f"Error: more than {MAX_TOOL_CALLS_PER_REPLY} tool calls in one reply. "
+                              "This call was not run. Ask for fewer calls at a time.")
+                else:
+                    result = self.tools.run(name, arguments_json)
 
                 # The API insists: every tool call gets exactly one tool
                 # message, linked by tool_call_id, before the next model call.
@@ -114,15 +148,39 @@ class Agent:
         self.messages = self.messages[:1]
         self.total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
 
+    def _roll_back(self, user_message: dict) -> int:
+        """Remove this turn's messages. Returns how many were removed.
+
+        We look for the exact user message object that started the turn;
+        everything from it to the end belongs to this turn. If compaction
+        summarised it away already, we add a short assistant note instead,
+        so the list stays well formed either way.
+        """
+        for index, message in enumerate(self.messages):
+            if message is user_message:
+                removed = len(self.messages) - index
+                del self.messages[index:]
+                return removed
+        self.messages.append({"role": "assistant", "content": "The previous request failed and was abandoned."})
+        return 0
+
     def _fit_context(self, on_event: EventHandler) -> None:
-        """Shrink old messages when the estimate passes 80% of the window."""
+        """Shrink old messages when the estimate passes 80% of the window.
+
+        A failure here (the summariser is a model call too) is reported as
+        an error event and the turn continues with the unshrunk list.
+        """
         if self.context_window <= 0:
             return
         budget = int(self.context_window * 0.8)
         before = estimate_tokens(self.messages)
         if before <= budget:
             return
-        self.messages = fit_context(self.messages, budget, self.llm)
+        try:
+            self.messages = fit_context(self.messages, budget, self.llm)
+        except LLMError as error:
+            on_event({"type": "error", "text": f"Compaction failed, continuing without it: {error}"})
+            return
         after = estimate_tokens(self.messages)
         if after < before:
             on_event({"type": "compaction", "before_tokens": before, "after_tokens": after})

@@ -2,7 +2,8 @@
  * index.ts - the Cloudflare Worker in front of the Python agent.
  *
  * What it does, in order, for every request:
- *   1. Ask for a password (HTTP Basic auth) if APP_PASSWORD is set.
+ *   1. Ask for a password (HTTP Basic auth) on the private routes. With no
+ *      APP_PASSWORD configured those routes answer 503: shut, not open.
  *   2. Serve the static site (course + chat page) for every path except
  *      the three agent routes: /chat, /state, /reset.
  *   3. For those three, find this browser's sandbox (a cookie names it),
@@ -15,6 +16,7 @@
  */
 
 import { getSandbox, type Sandbox as SandboxType } from "@cloudflare/sandbox";
+import { isValidSessionId, readCookie, requireAuth } from "./auth.js";
 import { FILES } from "./bundle";
 
 export { Sandbox } from "@cloudflare/sandbox";
@@ -40,7 +42,7 @@ export default {
     // private, because a sandbox costs money and runs whatever the model asks.
     const isPrivate = AGENT_ROUTES.has(url.pathname) || url.pathname.startsWith("/app");
     if (isPrivate) {
-      const denied = requireAuth(request, env);
+      const denied = requireAuth(request, env.APP_PASSWORD);
       if (denied) return denied;
     }
 
@@ -48,25 +50,26 @@ export default {
       return env.ASSETS.fetch(request);
     }
 
-    // One sandbox per browser. The cookie is the only thing that links them.
+    // One sandbox per browser. The cookie is the only thing that links them,
+    // and only a cookie that looks like a UUID we issued is trusted.
     let session = readCookie(request, COOKIE);
     let isNewSession = false;
-    if (!session) {
+    if (!isValidSessionId(session)) {
       session = crypto.randomUUID();
       isNewSession = true;
     }
-    const sandbox = getSandbox(env.Sandbox, `session-${session}`, { sleepAfter: "15m" });
 
+    let upstream: Response;
     try {
+      const sandbox = getSandbox(env.Sandbox, `session-${session}`, { sleepAfter: "15m" });
       await ensureAgentRunning(sandbox, env);
+      upstream = await sandbox.containerFetch(request, AGENT_PORT);
     } catch (error) {
       return Response.json(
-        { error: `The sandbox could not start the agent: ${(error as Error).message}` },
+        { error: `The sandbox could not run the agent: ${(error as Error).message}` },
         { status: 503 },
       );
     }
-
-    const upstream = await sandbox.containerFetch(request, AGENT_PORT);
     if (!isNewSession) return upstream;
 
     // First contact: hand the browser its session cookie.
@@ -84,15 +87,16 @@ async function ensureAgentRunning(sandbox: SandboxType, env: Env): Promise<void>
   if (await isAgentUp(sandbox)) return;
 
   // Copy the package in. Cheap, and idempotent: a wake-up after sleep does it again.
+  // The workspace itself starts EMPTY apart from its README: there is no
+  // upload or git clone here; the agent creates what it needs.
   const dirs = new Set<string>();
   for (const path of Object.keys(FILES)) {
-    const folder = path.substring(0, path.lastIndexOf("/"));
-    if (folder) dirs.add(`${CODE_DIR}/${folder}`);
+    const target = targetPath(path);
+    dirs.add(target.substring(0, target.lastIndexOf("/")));
   }
   for (const dir of dirs) await sandbox.mkdir(dir, { recursive: true });
-  await sandbox.mkdir(WORKSPACE_DIR, { recursive: true });
   for (const [path, text] of Object.entries(FILES)) {
-    await sandbox.writeFile(`${CODE_DIR}/${path}`, text);
+    await sandbox.writeFile(targetPath(path), text);
   }
 
   await sandbox.startProcess("python3 -m agent.server", {
@@ -117,6 +121,12 @@ async function ensureAgentRunning(sandbox: SandboxType, env: Env): Promise<void>
   throw new Error("python3 -m agent.server did not start within 45 seconds");
 }
 
+/** Where a bundled file lands: the package under CODE_DIR, the workspace seed under WORKSPACE_DIR. */
+function targetPath(bundledPath: string): string {
+  if (bundledPath.startsWith("workspace/")) return `${WORKSPACE_DIR}/${bundledPath.substring("workspace/".length)}`;
+  return `${CODE_DIR}/${bundledPath}`;
+}
+
 async function isAgentUp(sandbox: SandboxType): Promise<boolean> {
   try {
     const probe = await sandbox.containerFetch(
@@ -128,37 +138,4 @@ async function isAgentUp(sandbox: SandboxType): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-/** HTTP Basic auth, only when APP_PASSWORD is configured. Username is free-form. */
-function requireAuth(request: Request, env: Env): Response | null {
-  if (!env.APP_PASSWORD) return null;
-  const header = request.headers.get("Authorization") ?? "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme === "Basic" && encoded) {
-    const decoded = atob(encoded);
-    const password = decoded.substring(decoded.indexOf(":") + 1);
-    if (timingSafeEqual(password, env.APP_PASSWORD)) return null;
-  }
-  return new Response("This page is private. Enter the password.", {
-    status: 401,
-    headers: { "WWW-Authenticate": 'Basic realm="coding-agent-blueprint", charset="UTF-8"' },
-  });
-}
-
-function timingSafeEqual(a: string, b: string): boolean {
-  const encoder = new TextEncoder();
-  const bytesA = encoder.encode(a);
-  const bytesB = encoder.encode(b);
-  if (bytesA.byteLength !== bytesB.byteLength) return false;
-  return crypto.subtle.timingSafeEqual(bytesA, bytesB);
-}
-
-function readCookie(request: Request, name: string): string | null {
-  const header = request.headers.get("Cookie") ?? "";
-  for (const part of header.split(";")) {
-    const [key, ...rest] = part.trim().split("=");
-    if (key === name) return rest.join("=");
-  }
-  return null;
 }

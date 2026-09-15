@@ -359,7 +359,8 @@ python3 -m agent.server                       # chat in the browser at http://12
 <li>The <code>try/except</code> in <code>run_tool</code> → one bad argument from the model crashes the whole program.</li>
 <li><code>safe_path</code> → "read <code>../../.ssh/id_rsa</code>" works.</li>
 <li>The uniqueness check in <code>edit_file</code> → the model changes the wrong occurrence, silently.</li>
-<li>The timeout in <code>run_command</code> → a command that waits for input (<code>python3</code> with no file) hangs the agent forever.</li>
+<li>The timeout in <code>run_command</code> → a command that waits for input (<code>python3</code> with no file) hangs the agent forever. The blueprint clamps it to two minutes and kills the whole process group.</li>
+<li>The minimal environment in <code>run_command</code> → <code>env</code> would print your API key to the model.</li>
 <li><code>truncate_output</code> → one <code>pip install</code> log fills the context window.</li>
 </ul></div>
 
@@ -413,7 +414,7 @@ python3 -m agent.server                       # chat in the browser at http://12
 <details><summary>The offline demo: course/ch07_web_window.py</summary>{{code:course/ch07_web_window.py}}</details>
 <div class="cmd">python3 course/ch07_web_window.py      # opens the real page with a scripted model, no key needed
 python3 -m agent.server               # the same page with the real model from .env</div>
-<div class="note"><h4>Settings inside the page</h4>The Settings button lets you point the page at a different agent server, and paste a key, base URL and model that override <code>.env</code> for this conversation. Those values live in your browser and in the server's memory only; nothing is written to disk.</div>
+<div class="note"><h4>Settings inside the page</h4>The Settings button lets you point the page at a different agent server, and enter a key, provider URL and model that override <code>.env</code> for the next message. The server URL, provider URL and model are remembered by your browser; the key is held in the page's memory only and is gone when the tab closes. The overrides become the server's active settings only after a message succeeds with them, so a typo in the model name gives you one clear error and nothing else changes. <b>Use server defaults</b> clears all of it. If a run never ends, <b>Stop</b> makes the page stop listening; the server finishes the turn on its own.</div>
 
 <!-- ===================================================== CH 8 ============== -->
 <h2 id="ch8">8 · Context: what the model sees first, and what to do when the list gets long</h2>
@@ -472,7 +473,7 @@ python3 -m agent.server               # the same page with the real model from .
 <tr><td>6</td><td>"Stopped after N steps without a final answer"</td><td>The model loops on the same tool</td><td>The brake. Read the Messages tab: what did it keep asking for? Usually a tool result it could not act on.</td></tr>
 <tr><td>7</td><td>Answers get vague; HTTP 400 context length</td><td>Huge tool outputs or a very long session</td><td><code>truncate_output</code> and compaction. Check <code>AGENT_CONTEXT_WINDOW</code> matches the model.</td></tr>
 <tr><td>8</td><td>The agent hangs on a command</td><td>The command waited for input</td><td>The timeout kills it and reports it. Tell the model to pass <code>timeout_seconds</code> or avoid interactive commands.</td></tr>
-<tr><td>9</td><td>The answer is "Error: HTTP 401 / 402 / 429 / 404 …"</td><td>Key, credits, rate limit, model id</td><td><code>explain_http_error</code> in <code>agent/llm.py</code> already says what to do. Check <code>.env</code>, then the provider dashboard.</td></tr>
+<tr><td>9</td><td>The answer is "Error: HTTP 401 / 402 / 429 / 404 …"</td><td>Key, credits, rate limit, model id</td><td><code>explain_http_error</code> in <code>agent/llm.py</code> already says what to do. The failed turn is rolled back, so the next message starts clean. Check <code>.env</code> or the page's Settings (Use server defaults clears a bad model name), then the provider dashboard.</td></tr>
 <tr><td>10</td><td>The model describes what it would do instead of doing it</td><td>Tools not sent, model without tool support, or a weak description</td><td>Confirm <code>tools</code> is in the payload; pick a model that lists <code>tools</code> in its supported parameters; write descriptions that say <em>when</em> to use the tool.</td></tr>
 <tr><td>11</td><td>HTTP 400 mentioning tool_call_id or message order</td><td>The list is malformed: a tool message with no request, or a user message before all requests were answered</td><td>Run <code>check_message_order(agent.messages)</code> from <code>agent/debug.py</code>. It names the bad index.</td></tr>
 <tr><td>12</td><td>HTTP 400 from a <em>different</em> provider after switching models</td><td>Provider-specific fields (reasoning, refusal) sent back in the history</td><td><code>clean_assistant_message</code> keeps only role, content and tool_calls.</td></tr>
@@ -534,11 +535,11 @@ python3 -m agent.server               # the same page with the real model from .
 <tr><th></th><th>Static site (free plan)</th><th>Sandboxed agent (Workers Paid, $5/month)</th></tr>
 <tr><td>What is hosted</td><td>This course and the chat page</td><td>This course, the chat page, and the same Python package running in a Linux container per browser session</td></tr>
 <tr><td>Where the agent runs</td><td>On your computer: <code>python3 -m agent.server</code>, then set the Agent server URL in the page's Settings to <code>http://127.0.0.1:8765</code> (Chrome or Firefox)</td><td>In the cloud. The Worker copies <code>agent/</code> into the sandbox and runs the exact command above</td></tr>
-<tr><td>Where the key lives</td><td>In your <code>.env</code>, or pasted into the page's Settings</td><td>Pasted into the page's Settings; sent to the sandbox with each message, held in memory only</td></tr>
+<tr><td>Where the key lives</td><td>In your <code>.env</code>, or typed into the page's Settings (page memory only, never saved)</td><td>Typed into the page's Settings; sent to the sandbox with each message, held in memory only</td></tr>
 <tr><td>Deploy command</td><td><code>npm run deploy:site</code> in <code>deploy/cloudflare</code></td><td><code>npm run deploy:sandbox</code> in <code>deploy/cloudflare</code></td></tr>
 </table></div>
-<div class="warn"><h4>Two honest limits</h4>
-The cloud sandbox sleeps after 15 idle minutes and forgets its files and conversation; that is what makes it cheap. And a coding agent runs whatever commands the model chooses, so the hosted page is behind a password. On your own machine the workspace lock is a convenience, not a security boundary: the commands run as you.</div>
+<div class="warn"><h4>Three honest limits</h4>
+The cloud sandbox sleeps after 15 idle minutes and forgets its files and conversation; that is what makes it cheap, and its workspace starts empty apart from a README. A coding agent runs whatever commands the model chooses, so the hosted chat page is behind a password and, with no password configured, refuses to serve at all. And on your own machine <code>run_command</code> is a real shell running as you: the workspace folder confines the four file tools, not the shell. The blueprint gives that shell a minimal environment without your API key, a clamped timeout that kills the whole process group, and capped output; the real boundary on the hosted version is Cloudflare's container, and a local operating-system sandbox is outside this blueprint's scope.</div>
 
 <!-- ===================================================== GLOSSARY ========== -->
 <h2 id="glossary">Glossary</h2>
