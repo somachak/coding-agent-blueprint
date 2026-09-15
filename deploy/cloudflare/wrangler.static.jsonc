@@ -1,0 +1,11 @@
+// Fallback deployment: the course site and the chat page only, no agent in
+// the cloud. Works on the free plan. The page talks to an agent server you
+// run on your own computer (python3 -m agent.server).
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "coding-agent-blueprint",
+  "compatibility_date": "2026-09-01",
+  "assets": {
+    "directory": "../../site"
+  }
+}

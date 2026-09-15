@@ -1,0 +1,21 @@
+# Secrets: never commit the real key
+.env
+
+# Python noise
+__pycache__/
+*.pyc
+.venv/
+
+# The agent's scratch workspace contents (keep the folder, not the files)
+workspace/*
+!workspace/README.md
+!workspace/.gitkeep
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Cloudflare
+.wrangler/
+node_modules/

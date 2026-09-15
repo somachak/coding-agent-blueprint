@@ -1,0 +1,17 @@
+{
+  "name": "coding-agent-blueprint-deploy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy:site": "wrangler deploy -c wrangler.static.jsonc",
+    "deploy:sandbox": "wrangler deploy -c wrangler.jsonc"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260914.1",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.131.2"
+  },
+  "dependencies": {
+    "@cloudflare/sandbox": "0.12.9"
+  }
+}

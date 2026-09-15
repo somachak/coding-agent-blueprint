@@ -1,0 +1,30 @@
+// Full deployment: static site + the Python agent running inside a Cloudflare
+// Sandbox (a real Linux container, one per browser session).
+// Needs the Workers Paid plan ($5/month). No Docker needed on your machine:
+// the image is pulled straight from Docker Hub.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "coding-agent-blueprint",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "../../site",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      // MUST match the @cloudflare/sandbox version in package.json.
+      "image": "docker.io/cloudflare/sandbox:0.12.9-python",
+      "instance_type": "lite",
+      "max_instances": 3
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "Sandbox", "class_name": "Sandbox" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sandbox"] }],
+  "observability": { "enabled": true }
+}

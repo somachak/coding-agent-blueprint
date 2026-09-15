@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build a Coding Agent From Scratch — the blueprint</title>
+<style>
+  :root {
+    --bg: #fbfbfb; --panel: #ffffff; --ink: #1f2933; --heading: #222; --muted: #5b6b7a; --line: #d9e0e8;
+    --accent: #3b6fd6; --note-bg: #eaf2ff; --warn-bg: #fff6e0; --warn-border: #d6a13b; --bad-bg: #fdecea; --bad-border: #c0392b;
+    --code-bg: #f6f8fb; --code-ink: #182635; --comment: #536784; --doc: #716185; --string: #8a4b08; --keyword: #1d4ed8; --builtin: #0f6b8a; --number: #9a3412;
+    --mono: "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color: var(--ink); background: var(--bg); line-height: 1.6; }
+  .layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 100vh; }
+  nav.side { position: sticky; top: 0; height: 100vh; overflow-y: auto; padding: 22px 18px; border-right: 1px solid var(--line); background: var(--panel); font-size: 13px; }
+  nav.side .brand { font-weight: 800; color: var(--heading); font-size: 15px; margin-bottom: 4px; }
+  nav.side .sub { color: var(--muted); margin-bottom: 16px; }
+  nav.side a { display: block; color: var(--ink); text-decoration: none; padding: 5px 8px; border-radius: 6px; }
+  nav.side a:hover { background: var(--note-bg); color: var(--accent); }
+  nav.side .group { margin-top: 12px; font-size: 11px; letter-spacing: .6px; text-transform: uppercase; color: var(--muted); padding: 0 8px; }
+  main { padding: 28px 40px 80px; max-width: 920px; }
+  h1 { color: var(--heading); font-size: 30px; margin: 0 0 6px; line-height: 1.2; }
+  h2 { color: var(--heading); font-size: 22px; margin: 56px 0 10px; padding-bottom: 8px; border-bottom: 2px solid var(--heading); }
+  h3 { color: var(--heading); font-size: 16px; margin: 28px 0 8px; }
+  p, li { font-size: 15px; }
+  .lede { color: var(--muted); font-size: 16px; margin-bottom: 18px; }
+  .note { background: var(--note-bg); border-left: 4px solid var(--accent); padding: 10px 16px; border-radius: 6px; margin: 16px 0; }
+  .warn { background: var(--warn-bg); border-left: 4px solid var(--warn-border); padding: 10px 16px; border-radius: 6px; margin: 16px 0; }
+  .breaks { background: var(--bad-bg); border-left: 4px solid var(--bad-border); padding: 10px 16px; border-radius: 6px; margin: 16px 0; }
+  .breaks h4, .note h4, .warn h4 { margin: 0 0 6px; font-size: 13px; letter-spacing: .5px; text-transform: uppercase; color: var(--muted); }
+  code { font-family: var(--mono); font-size: .92em; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; color: var(--code-ink); }
+  pre { margin: 0; }
+  .cmd { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; font-family: var(--mono); font-size: 13px; color: var(--code-ink); overflow-x: auto; margin: 10px 0; }
+  figure.code { margin: 14px 0; border: 1px solid var(--line); border-radius: 8px; background: var(--code-bg); overflow: hidden; }
+  figure.code figcaption { display: flex; justify-content: space-between; gap: 12px; padding: 6px 12px; font-size: 12px; background: #eef2f7; border-bottom: 1px solid var(--line); color: var(--muted); }
+  figure.code figcaption .path { font-family: var(--mono); color: var(--code-ink); font-weight: 600; }
+  figure.code pre { padding: 12px 14px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; color: var(--code-ink); }
+  figure.code .ln { display: inline-block; width: 3em; color: #9aa5b1; user-select: none; }
+  .c { color: var(--comment); } .d { color: var(--doc); } .s { color: var(--string); } .k { color: var(--keyword); font-weight: 600; } .b { color: var(--builtin); } .n { color: var(--number); }
+  details { margin: 12px 0; }
+  details > summary { cursor: pointer; font-weight: 600; color: var(--accent); padding: 6px 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin: 12px 0; }
+  th, td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th { background: #f2f5fa; }
+  .table-wrap { overflow-x: auto; }
+  svg.diagram { width: 100%; height: auto; max-width: 820px; display: block; margin: 14px auto; }
+  svg.diagram text { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 13px; fill: var(--ink); }
+  svg.diagram .box { fill: #fff; stroke: #1f2933; stroke-width: 1.4; rx: 8; }
+  svg.diagram .soft { fill: var(--note-bg); stroke: var(--accent); stroke-width: 1.2; rx: 8; }
+  svg.diagram .tool { fill: #fff6e0; stroke: #b26a00; stroke-width: 1.2; rx: 8; }
+  svg.diagram .out { fill: #f1f3f5; stroke: #8a95a1; stroke-width: 1.2; stroke-dasharray: 4 3; rx: 8; }
+  svg.diagram .arrow { stroke: #1f2933; stroke-width: 1.4; fill: none; marker-end: url(#arrowhead); }
+  svg.diagram .label { font-size: 11.5px; fill: var(--muted); }
+  svg.diagram .title { font-weight: 700; }
+  svg.diagram .mono { font-family: var(--mono); font-size: 11.5px; }
+  .cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+  .card { border: 1px solid var(--line); border-left: 5px solid var(--line); border-radius: 8px; background: var(--panel); padding: 8px 12px; font-size: 13px; min-width: 150px; flex: 1; }
+  .card .role { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); font-weight: 700; }
+  .card.system { border-left-color: #9aa5b1; } .card.user { border-left-color: var(--accent); } .card.assistant { border-left-color: #b26a00; } .card.tool { border-left-color: #2e7d32; }
+  .card pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; margin: 4px 0 0; color: var(--code-ink); }
+
+  /* the step-through trace */
+  .trace { border: 2px solid var(--accent); border-radius: 10px; background: var(--panel); margin: 18px 0; overflow: hidden; }
+  .trace .bar { display: flex; align-items: center; gap: 8px; padding: 10px 14px; background: var(--note-bg); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .trace .bar b { margin-right: auto; }
+  .trace button { background: var(--panel); border: 1px solid var(--accent); color: var(--accent); border-radius: 6px; padding: 5px 12px; font-size: 13px; cursor: pointer; }
+  .trace button:disabled { opacity: .4; cursor: default; }
+  .trace .grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 0; }
+  .trace .codepane { border-right: 1px solid var(--line); padding: 12px 14px; font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); }
+  .trace .codepane div { padding: 1px 6px; white-space: pre; border-radius: 4px; color: var(--code-ink); }
+  .trace .codepane div.active { background: #fde68a; outline: 2px solid #d6a13b; }
+  .trace .codepane div.done { color: #7c8794; }
+  .trace .panels { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; font-size: 13px; }
+  .trace .panel { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .trace .panel h5 { margin: 0 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+  .trace .panel pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; margin: 0; color: var(--code-ink); }
+  .trace .explain { padding: 12px 14px; border-top: 1px solid var(--line); background: #fffdf5; font-size: 14px; }
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+    nav.side { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--line); }
+    main { padding: 20px 16px 60px; }
+    .trace .grid { grid-template-columns: 1fr; } .trace .codepane { border-right: none; border-bottom: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">Coding agent blueprint</div>
+  <div class="sub">from one HTTP call to a reusable agent, in ten chapters</div>
+  <a href="#map">0 · The map</a>
+  <a href="#setup">Setup</a>
+  <div class="group">Build it</div>
+  <a href="#ch1">1 · One call</a>
+  <a href="#ch2">2 · The list that grows</a>
+  <a href="#ch3">3 · The first tool</a>
+  <a href="#ch4">4 · The loop</a>
+  <a href="#ch5">5 · Registry + coding tools</a>
+  <a href="#ch6">6 · Events → the package</a>
+  <a href="#ch7">7 · The web window</a>
+  <a href="#ch8">8 · Context</a>
+  <div class="group">Own it</div>
+  <a href="#ch9">9 · Troubleshooting lab</a>
+  <a href="#ch10">10 · Your own tools</a>
+  <a href="#hosting">Run · GitHub · Cloudflare</a>
+  <a href="#glossary">Glossary</a>
+  <div class="group">Try it</div>
+  <a href="app/">Open the chat window →</a>
+</nav>
+<main>
+
+<h1>Build a Coding Agent From Scratch</h1>
+<p class="lede">A course that ends in a blueprint: a bare-bones, model-agnostic coding agent in plain Python, with a single chat window that shows every step it takes. Every code block on this page is the real file, embedded at build time. Nothing here is a quiz; each idea is explained directly, then shown running.</p>
+
+<div class="note"><h4>How to read this</h4>
+Each chapter adds exactly one mechanism. For each one you get: what it is for, a picture, the code, a command to run it, and a list of what breaks if you take it out. The "what breaks" lists are the troubleshooting course in disguise: when the agent misbehaves later, the symptom will be on one of those lists.</div>
+
+<!-- ===================================================== 0. THE MAP ============ -->
+<h2 id="map">0 · The map: five parts, one loop</h2>
+<p>A coding agent is not a special kind of model. It is an ordinary model, called over and over, with a list of messages that grows and a handful of Python functions it is allowed to ask for. The whole design fits in one picture.</p>
+
+<svg class="diagram" viewBox="0 0 820 330" role="img" aria-label="The five parts of the agent and how they connect">
+  <defs><marker id="arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#1f2933"/></marker></defs>
+  <rect class="box" x="300" y="120" width="220" height="80"/>
+  <text x="410" y="150" text-anchor="middle" class="title">THE LOOP  (agent/loop.py)</text>
+  <text x="410" y="172" text-anchor="middle" class="label">reason → act → observe → repeat</text>
+  <text x="410" y="188" text-anchor="middle" class="label">stops when the reply has no tool calls</text>
+
+  <rect class="soft" x="20" y="120" width="220" height="80"/>
+  <text x="130" y="150" text-anchor="middle" class="title">THE MODEL  (agent/llm.py)</text>
+  <text x="130" y="172" text-anchor="middle" class="label">one HTTP POST: messages + tool menu in,</text>
+  <text x="130" y="188" text-anchor="middle" class="label">one assistant message out</text>
+
+  <rect class="tool" x="580" y="120" width="220" height="80"/>
+  <text x="690" y="150" text-anchor="middle" class="title">THE TOOLS  (agent/tools.py)</text>
+  <text x="690" y="172" text-anchor="middle" class="label">registry: name → function + schema</text>
+  <text x="690" y="188" text-anchor="middle" class="label">every result is text, errors included</text>
+
+  <rect class="box" x="300" y="20" width="220" height="60"/>
+  <text x="410" y="45" text-anchor="middle" class="title">THE MESSAGES  (a Python list)</text>
+  <text x="410" y="65" text-anchor="middle" class="label">system · user · assistant · tool · …  it only grows</text>
+
+  <rect class="tool" x="580" y="240" width="220" height="70"/>
+  <text x="690" y="266" text-anchor="middle" class="title">THE WORKSPACE  (agent/workspace.py)</text>
+  <text x="690" y="286" text-anchor="middle" class="label">list · read · write · edit · run, locked to one folder</text>
+
+  <rect class="out" x="20" y="240" width="220" height="70"/>
+  <text x="130" y="266" text-anchor="middle" class="title">YOU  (cli.py / server.py / your app)</text>
+  <text x="130" y="286" text-anchor="middle" class="label">send a message, receive events</text>
+
+  <path class="arrow" d="M240,150 L300,150"/><text x="270" y="142" text-anchor="middle" class="label">reply</text>
+  <path class="arrow" d="M300,175 L240,175"/><text x="270" y="192" text-anchor="middle" class="label">messages</text>
+  <path class="arrow" d="M520,150 L580,150"/><text x="550" y="142" text-anchor="middle" class="label">name + args</text>
+  <path class="arrow" d="M580,175 L520,175"/><text x="550" y="192" text-anchor="middle" class="label">text</text>
+  <path class="arrow" d="M410,120 L410,80"/><text x="440" y="104" class="label">append</text>
+  <path class="arrow" d="M690,200 L690,240"/>
+  <path class="arrow" d="M130,240 L130,200"/><text x="150" y="224" class="label">on_event(...)</text>
+</svg>
+
+<p>The loop in the middle knows nothing about HTTP and nothing about files. It knows three things: <em>messages go in, a message comes out; if the message asks for tools, run them and append the results; otherwise stop</em>. That ignorance is deliberate. It is why the same loop can drive a terminal, a web page, or your own application, and why the tools can be swapped for anything.</p>
+
+<h3>The folder, one job per file</h3>
+<div class="table-wrap"><table>
+<tr><th>File</th><th>Its one question</th><th>Chapter</th></tr>
+<tr><td><code>agent/config.py</code></td><td>Where do the settings come from? (a hand-written <code>.env</code> reader)</td><td>1</td></tr>
+<tr><td><code>agent/llm.py</code></td><td>How do we talk to the model? (one function, plain HTTP, clear error messages)</td><td>1, 9</td></tr>
+<tr><td><code>agent/tools.py</code></td><td>What is a tool, and how is one run safely?</td><td>5</td></tr>
+<tr><td><code>agent/workspace.py</code></td><td>What can the agent do to files, and where?</td><td>5</td></tr>
+<tr><td><code>agent/loop.py</code></td><td>What happens for one user message?</td><td>4, 6</td></tr>
+<tr><td><code>agent/context.py</code></td><td>What when the list gets too long?</td><td>8</td></tr>
+<tr><td><code>agent/fake_llm.py</code></td><td>How do we test without spending money?</td><td>6, 9</td></tr>
+<tr><td><code>agent/debug.py</code></td><td>Why did the API say 400?</td><td>9</td></tr>
+<tr><td><code>agent/cli.py</code>, <code>agent/server.py</code>, <code>web/index.html</code></td><td>How do a human and the loop meet?</td><td>7</td></tr>
+<tr><td><code>agent/__init__.py</code></td><td>How are the pieces wired together? (<code>create_agent</code>, the system prompt)</td><td>6, 8</td></tr>
+</table></div>
+
+<!-- ===================================================== SETUP ============= -->
+<h2 id="setup">Setup: three things, then everything runs</h2>
+<ol>
+<li><b>Python 3.11 or newer.</b> Nothing to install: the whole blueprint uses only the standard library.</li>
+<li><b>A key.</b> Copy <code>.env.example</code> to <code>.env</code> and paste an OpenRouter key into <code>LLM_API_KEY</code>. Any OpenAI-compatible endpoint works too (OpenAI, Groq, a local Ollama); change <code>LLM_BASE_URL</code> and <code>LLM_MODEL</code>.</li>
+<li><b>A model that supports tools.</b> The default is <code>openai/gpt-5-mini</code>. Cheaper: <code>openai/gpt-5-nano</code>. Free (rate-limited): <code>google/gemma-4-31b-it:free</code>. If a model answers in prose instead of calling tools, that is the model, not your code (chapter 9, case 10).</li>
+</ol>
+<div class="cmd">cd "Fable version"
+python3 -m unittest discover -s tests -t .    # 35 offline tests, no key needed
+python3 -m agent                              # chat in the terminal
+python3 -m agent.server                       # chat in the browser at http://127.0.0.1:8765</div>
+<div class="note"><h4>The workspace</h4>The agent may only touch the <code>workspace/</code> folder. Put a small project in there to play with, or let the agent create one. Delete its contents whenever you like.</div>
+
+<!-- ===================================================== CH 1 ============== -->
+<h2 id="ch1">1 · One call to the model</h2>
+<p>Before there is an agent there is a single HTTP request. Chapter 1 is that request and nothing else. Three things go out: which model, a list of messages, and the key that proves you may ask. One thing comes back: a JSON document with the model's message inside it.</p>
+
+<svg class="diagram" viewBox="0 0 820 170" role="img" aria-label="Request and response shapes">
+  <rect class="box" x="20" y="30" width="330" height="110"/>
+  <text x="185" y="52" text-anchor="middle" class="title">REQUEST  (JSON text, POST)</text>
+  <text x="34" y="78" class="mono">{"model": "openai/gpt-5-mini",</text>
+  <text x="34" y="96" class="mono"> "messages": [ {"role":"system","content":"…"},</text>
+  <text x="34" y="114" class="mono">               {"role":"user",  "content":"…"} ]}</text>
+  <text x="34" y="132" class="label">header:  Authorization: Bearer &lt;key&gt;</text>
+  <path class="arrow" d="M350,70 L470,70"/><text x="410" y="62" text-anchor="middle" class="label">urlopen(request)</text>
+  <path class="arrow" d="M470,110 L350,110"/><text x="410" y="128" text-anchor="middle" class="label">response.read()</text>
+  <rect class="soft" x="470" y="30" width="330" height="110"/>
+  <text x="635" y="52" text-anchor="middle" class="title">REPLY  (JSON text)</text>
+  <text x="484" y="78" class="mono">{"choices": [ {"message": {"role":"assistant",</text>
+  <text x="484" y="96" class="mono">                          "content":"…"} } ],</text>
+  <text x="484" y="114" class="mono"> "usage": {"prompt_tokens": 32, …}}</text>
+  <text x="484" y="132" class="label">reply["choices"][0]["message"]  is the part we keep</text>
+</svg>
+
+<p>The words to own here: a <b>message</b> is a dictionary with a <code>role</code> and <code>content</code>. <b>JSON</b> is the text form of dictionaries and lists that travels over HTTP; <code>json.dumps</code> makes text from Python, <code>json.loads</code> makes Python from text. The model does not see Python. It sees text.</p>
+
+<details open><summary>The code: course/ch01_one_call.py</summary>{{code:course/ch01_one_call.py}}</details>
+<div class="cmd">python3 course/ch01_one_call.py</div>
+<div class="breaks"><h4>What breaks if you remove it</h4>
+<ul>
+<li>No <code>Authorization</code> header → HTTP 401. The server does not know who is asking.</li>
+<li>A wrong model id → HTTP 400 or 404. Read the body; it names the problem.</li>
+<li>An empty <code>messages</code> list → HTTP 400. There is nothing to answer.</li>
+</ul></div>
+
+<!-- ===================================================== CH 2 ============== -->
+<h2 id="ch2">2 · The list that grows (memory is not in the model)</h2>
+<p>A chat is chapter 1 inside <code>while True</code>, plus one rule: <em>every message, yours and the model's, is appended to the same list, and the whole list is sent every time</em>. The model has no memory. Each call starts from zero. It only appears to remember because you keep handing it the transcript.</p>
+
+<div class="cards">
+  <div class="card system"><div class="role">0 · system</div><pre>You are a friendly assistant.</pre></div>
+  <div class="card user"><div class="role">1 · user</div><pre>My name is Soma.</pre></div>
+  <div class="card assistant"><div class="role">2 · assistant</div><pre>Nice to meet you, Soma!</pre></div>
+  <div class="card user"><div class="role">3 · user</div><pre>What is my name?</pre></div>
+  <div class="card assistant"><div class="role">4 · assistant</div><pre>Your name is Soma.</pre></div>
+</div>
+<p>That is the real transcript from running the chapter. On the second question the model was sent all four earlier cards. Delete the line that appends the assistant's reply (marked <code>(A)</code> in the file) and it will still answer, but it will have forgotten what it just said, because you never showed it.</p>
+
+<details><summary>The code: course/ch02_chat_loop.py</summary>{{code:course/ch02_chat_loop.py}}</details>
+<div class="cmd">python3 course/ch02_chat_loop.py</div>
+<div class="breaks"><h4>What breaks if you remove it</h4>
+<ul>
+<li>Stop appending the assistant reply → the model contradicts itself, and later chapters get HTTP 400 because tool results answer requests that are no longer in the list.</li>
+<li>Stop appending the user message → the model answers the previous question again.</li>
+</ul></div>
+
+<!-- ===================================================== CH 3 ============== -->
+<h2 id="ch3">3 · The first tool (this is the chapter where it becomes an agent)</h2>
+<p>A tool is a normal Python function. The model cannot run it. What the model <em>can</em> do is write a small piece of JSON that says "please call this name with these arguments". You run the function, put the result back into the list as a <code>tool</code> message, and call the model again. That round trip is the entire trick.</p>
+
+<svg class="diagram" viewBox="0 0 820 300" role="img" aria-label="One tool round trip as a sequence">
+  <text x="90" y="24" text-anchor="middle" class="title">your script</text>
+  <text x="410" y="24" text-anchor="middle" class="title">the model (over HTTP)</text>
+  <text x="730" y="24" text-anchor="middle" class="title">the disk</text>
+  <line x1="90" y1="34" x2="90" y2="290" stroke="#c4ccd6" stroke-dasharray="4 4"/>
+  <line x1="410" y1="34" x2="410" y2="290" stroke="#c4ccd6" stroke-dasharray="4 4"/>
+  <line x1="730" y1="34" x2="730" y2="290" stroke="#c4ccd6" stroke-dasharray="4 4"/>
+  <path class="arrow" d="M90,60 L410,60"/><text x="250" y="52" text-anchor="middle" class="label">POST  messages (system, user)  +  tools menu</text>
+  <path class="arrow" d="M410,100 L90,100"/><text x="250" y="92" text-anchor="middle" class="label">assistant: tool_calls = [ read_file, arguments='{"path":"notes.txt"}' ]</text>
+  <text x="100" y="130" class="label">append that assistant message, exactly as sent</text>
+  <path class="arrow" d="M90,150 L730,150"/><text x="410" y="142" text-anchor="middle" class="label">read_file(path="notes.txt")   ← json.loads, then **arguments</text>
+  <path class="arrow" d="M730,180 L90,180"/><text x="410" y="172" text-anchor="middle" class="label">"The launch code is PINEAPPLE-42."</text>
+  <text x="100" y="210" class="label">append {"role": "tool", "tool_call_id": call["id"], "content": result}</text>
+  <path class="arrow" d="M90,235 L410,235"/><text x="250" y="227" text-anchor="middle" class="label">POST  messages (system, user, assistant, tool)</text>
+  <path class="arrow" d="M410,270 L90,270"/><text x="250" y="262" text-anchor="middle" class="label">assistant: "The launch code is PINEAPPLE-42."   (no tool_calls → done)</text>
+</svg>
+
+<h3>Step through it, one operation at a time</h3>
+<p>The values below are the real ones captured from running the chapter. Press <b>Next</b> to advance one operation; nothing moves on its own.</p>
+
+<div class="trace" id="trace-ch3">
+  <div class="bar"><b>Chapter 3, one round trip</b><span id="t3-pos" style="color:var(--muted)"></span>
+    <button id="t3-restart">Restart</button><button id="t3-back">← Back</button><button id="t3-next">Next →</button></div>
+  <div class="grid">
+    <div class="codepane" id="t3-code"></div>
+    <div class="panels">
+      <div class="panel"><h5>Names and their values</h5><pre id="t3-names"></pre></div>
+      <div class="panel"><h5>The messages list</h5><pre id="t3-messages"></pre></div>
+      <div class="panel"><h5>Screen output</h5><pre id="t3-screen"></pre></div>
+      <div class="panel"><h5>Outside the program (network, disk)</h5><pre id="t3-outside"></pre></div>
+    </div>
+  </div>
+  <div class="explain" id="t3-explain"></div>
+</div>
+
+<details><summary>The code: course/ch03_first_tool.py</summary>{{code:course/ch03_first_tool.py}}</details>
+<div class="cmd">python3 course/ch03_first_tool.py</div>
+<div class="breaks"><h4>What breaks if you remove it</h4>
+<ul>
+<li>Leave <code>tools</code> out of the payload → the model answers from imagination. It cannot ask for a tool it was never offered.</li>
+<li>Forget to append the assistant message (the one with <code>tool_calls</code>) before the tool message → HTTP 400. The API refuses a tool result that answers no request.</li>
+<li>Use the wrong <code>tool_call_id</code> → HTTP 400, same reason.</li>
+<li>Skip <code>json.loads</code> → <code>read_file(**"{...}")</code> is a TypeError; arguments arrive as text and must be parsed.</li>
+</ul></div>
+
+<!-- ===================================================== CH 4 ============== -->
+<h2 id="ch4">4 · The loop</h2>
+<p>Chapter 3 did one round trip by hand. Real tasks need several, and nobody knows how many in advance. So the round trip goes inside <code>while True</code> with one stopping rule and one brake:</p>
+<ul>
+<li><b>Stop</b> when the reply has no <code>tool_calls</code>. That reply is the answer.</li>
+<li><b>Brake</b> after <code>MAX_STEPS</code> model calls. A model can get stuck asking for the same thing forever, and every call costs money.</li>
+</ul>
+
+<svg class="diagram" viewBox="0 0 820 230" role="img" aria-label="The loop as a state machine">
+  <rect class="soft" x="40" y="80" width="150" height="60"/><text x="115" y="115" text-anchor="middle" class="title">wait for user</text>
+  <rect class="box" x="290" y="80" width="150" height="60"/><text x="365" y="107" text-anchor="middle" class="title">call model</text><text x="365" y="125" text-anchor="middle" class="label">append reply</text>
+  <rect class="tool" x="540" y="80" width="150" height="60"/><text x="615" y="107" text-anchor="middle" class="title">run tools</text><text x="615" y="125" text-anchor="middle" class="label">append one tool msg each</text>
+  <rect class="box" x="290" y="170" width="150" height="45"/><text x="365" y="197" text-anchor="middle" class="title">show answer</text>
+  <rect class="out" x="540" y="170" width="150" height="45"/><text x="615" y="197" text-anchor="middle" class="title">stop: brake hit</text>
+  <path class="arrow" d="M190,110 L290,110"/><text x="240" y="102" text-anchor="middle" class="label">append user msg</text>
+  <path class="arrow" d="M440,100 L540,100"/><text x="490" y="92" text-anchor="middle" class="label">has tool_calls</text>
+  <path class="arrow" d="M540,125 C500,160 430,160 440,125"/><text x="490" y="160" text-anchor="middle" class="label">go round again</text>
+  <path class="arrow" d="M365,140 L365,170"/><text x="380" y="160" class="label">no tool_calls</text>
+  <path class="arrow" d="M290,192 C200,192 115,180 115,140"/>
+  <path class="arrow" d="M615,140 L615,170"/><text x="630" y="160" class="label">step == MAX_STEPS</text>
+</svg>
+
+<p>Notice what the loop does <em>not</em> contain: no knowledge of what a file is, no HTTP details, no special cases per tool. The lookup table <code>FUNCTIONS</code> turns a name into a function; the loop calls whatever it finds. Adding a tool never touches the loop again.</p>
+
+<details><summary>The code: course/ch04_the_loop.py</summary>{{code:course/ch04_the_loop.py}}</details>
+<div class="cmd">python3 course/ch04_the_loop.py</div>
+<div class="breaks"><h4>What breaks if you remove it</h4>
+<ul>
+<li>Remove the <code>break</code> on "no tool calls" → the loop asks the model again with nothing new; it repeats itself until the brake stops it.</li>
+<li>Remove <code>MAX_STEPS</code> → a stuck model runs, and bills you, until you kill the process.</li>
+<li>Handle only <code>tool_calls[0]</code> → the model often asks for several tools at once (chapter 4's run asked for five reads in one go); the unanswered ones cause HTTP 400 on the next call.</li>
+</ul></div>
+
+<!-- ===================================================== CH 5 ============== -->
+<h2 id="ch5">5 · The registry, and the five tools that make it a coding agent</h2>
+<p>Chapter 4's lookup table becomes the centre of the design. One table, two halves side by side: on the left, the <b>schema</b> the model reads; on the right, the <b>function</b> we run. If a name is in one half and not the other, the agent breaks in a very specific way (chapter 9, case 1).</p>
+
+<svg class="diagram" viewBox="0 0 820 250" role="img" aria-label="The registry as a two-column lookup table">
+  <rect class="box" x="20" y="20" width="780" height="210"/>
+  <text x="40" y="45" class="title">REGISTRY  =  { name : { schema (for the model) , function (for us) } }</text>
+  <line x1="20" y1="55" x2="800" y2="55" stroke="#1f2933"/>
+  <line x1="200" y1="55" x2="200" y2="230" stroke="#d9e0e8"/><line x1="560" y1="55" x2="560" y2="230" stroke="#d9e0e8"/>
+  <text x="40" y="78" class="mono">"list_files"</text><text x="215" y="78" class="label">"List every file in the workspace, with sizes. Start here."</text><text x="575" y="78" class="mono">workspace.list_files</text>
+  <text x="40" y="108" class="mono">"read_file"</text><text x="215" y="108" class="label">"Read a text file with line numbers."   path: string</text><text x="575" y="108" class="mono">workspace.read_file</text>
+  <text x="40" y="138" class="mono">"write_file"</text><text x="215" y="138" class="label">"Create a file or completely replace it."   path, content</text><text x="575" y="138" class="mono">workspace.write_file</text>
+  <text x="40" y="168" class="mono">"edit_file"</text><text x="215" y="168" class="label">"Replace ONE exact occurrence of old_text."   path, old_text, new_text</text><text x="575" y="168" class="mono">workspace.edit_file</text>
+  <text x="40" y="198" class="mono">"run_command"</text><text x="215" y="198" class="label">"Run a shell command; return output and exit code."   command</text><text x="575" y="198" class="mono">workspace.run_command</text>
+  <text x="40" y="222" class="label">the model's tool_calls[i].function.name is looked up in the left column → the right column is what runs</text>
+</svg>
+
+<p>Why these five and not more: Pi, one of the strongest minimal agents, ships four (read, write, edit, bash). Thorsten Ball's teaching agent ships three. Everything else (grep, git, tests, installs) is reachable through <code>run_command</code>. Why not <em>fewer</em>: without <code>edit_file</code> the model rewrites whole files and clobbers what it did not mean to touch; without <code>read_file</code> with line numbers it cannot quote exact text to edit.</p>
+
+<h3>Three rules the loop depends on</h3>
+<ol>
+<li><b>Every path is checked.</b> <code>safe_path</code> resolves <code>..</code> and symlinks with <code>os.path.realpath</code> and refuses anything outside the workspace root. Text checks like "does it start with the folder name" are not enough: a symlink inside the folder can point anywhere.</li>
+<li><b>Every tool returns text, even when it fails.</b> An exception would crash the loop. An error message goes back to the model, which reads it and tries something else. Chapter 5's live run shows this: the model ran <code>python countdown.py</code>, got <code>exit code 127: python: command not found</code>, and on the next step ran <code>python3</code>.</li>
+<li><b>Big outputs are cut in the middle.</b> The model needs the start (what happened) and the end (where it failed). The middle of a 50,000-character log only wastes the context window.</li>
+</ol>
+
+<details><summary>The code: course/ch05_registry_and_coding_tools.py</summary>{{code:course/ch05_registry_and_coding_tools.py}}</details>
+<div class="cmd">python3 course/ch05_registry_and_coding_tools.py</div>
+<div class="breaks"><h4>What breaks if you remove it</h4>
+<ul>
+<li>The <code>try/except</code> in <code>run_tool</code> → one bad argument from the model crashes the whole program.</li>
+<li><code>safe_path</code> → "read <code>../../.ssh/id_rsa</code>" works.</li>
+<li>The uniqueness check in <code>edit_file</code> → the model changes the wrong occurrence, silently.</li>
+<li>The timeout in <code>run_command</code> → a command that waits for input (<code>python3</code> with no file) hangs the agent forever.</li>
+<li><code>truncate_output</code> → one <code>pip install</code> log fills the context window.</li>
+</ul></div>
+
+<!-- ===================================================== CH 6 ============== -->
+<h2 id="ch6">6 · Events: the moment the script becomes a reusable blueprint</h2>
+<p>Chapters 1 to 5 were one growing script with <code>print()</code> inside the loop. That is fine for a terminal and useless for anything else: a web page, a log file, or your own app cannot see <code>print()</code>. So the loop stops printing and starts <b>reporting</b>. Every time something happens it calls a function you handed it, with a small dictionary describing the event.</p>
+
+<svg class="diagram" viewBox="0 0 820 200" role="img" aria-label="Events fan out to any consumer">
+  <rect class="box" x="40" y="70" width="200" height="60"/><text x="140" y="97" text-anchor="middle" class="title">Agent.run(text, on_event)</text><text x="140" y="116" text-anchor="middle" class="label">the loop, unchanged</text>
+  <rect class="soft" x="330" y="20" width="200" height="44"/><text x="430" y="47" text-anchor="middle">{"type": "model_call", "step": 1, …}</text>
+  <rect class="soft" x="330" y="78" width="200" height="44"/><text x="430" y="105" text-anchor="middle">{"type": "tool_call", "name": "read_file", …}</text>
+  <rect class="soft" x="330" y="136" width="200" height="44"/><text x="430" y="163" text-anchor="middle">{"type": "answer", "text": "…"}</text>
+  <rect class="out" x="620" y="20" width="180" height="44"/><text x="710" y="47" text-anchor="middle">cli.py prints a line</text>
+  <rect class="out" x="620" y="78" width="180" height="44"/><text x="710" y="105" text-anchor="middle">server.py streams a line</text>
+  <rect class="out" x="620" y="136" width="180" height="44"/><text x="710" y="163" text-anchor="middle">your app logs it</text>
+  <path class="arrow" d="M240,100 L330,42"/><path class="arrow" d="M240,100 L330,100"/><path class="arrow" d="M240,100 L330,158"/>
+  <path class="arrow" d="M530,42 L620,42"/><path class="arrow" d="M530,100 L620,100"/><path class="arrow" d="M530,158 L620,158"/>
+</svg>
+
+<p>That one change is what turns the script into the package in <code>agent/</code>. Read the loop below and check it against chapter 4: it is the same loop with <code>on_event(...)</code> where the prints were, wrapped in a class so the message list has somewhere to live between user messages.</p>
+
+<details open><summary>The loop as it ships: agent/loop.py</summary>{{code:agent/loop.py}}</details>
+<details><summary>Tools and the registry: agent/tools.py</summary>{{code:agent/tools.py}}</details>
+<details><summary>The five workspace tools: agent/workspace.py</summary>{{code:agent/workspace.py}}</details>
+<details><summary>The model call with readable errors: agent/llm.py</summary>{{code:agent/llm.py}}</details>
+<details><summary>How it is wired together: agent/__init__.py</summary>{{code:agent/__init__.py}}</details>
+
+<h3>The fake model: how you test without spending money</h3>
+<p><code>agent/fake_llm.py</code> is a scripted stand-in. You write the list of replies; it plays them back. Chapters 6 to 10 and all 35 tests run on it. When something goes wrong with the real agent, replaying the same script here tells you whether the bug is in your loop or in the model's behaviour.</p>
+<details><summary>The code: course/ch06_events_and_the_blueprint.py (runs offline)</summary>{{code:course/ch06_events_and_the_blueprint.py}}</details>
+<div class="cmd">python3 course/ch06_events_and_the_blueprint.py</div>
+
+<!-- ===================================================== CH 7 ============== -->
+<h2 id="ch7">7 · The web window</h2>
+<p><code>agent/server.py</code> is a small HTTP server from the standard library with four routes. Three of them are one line each. The fourth, <code>POST /chat</code>, is where the events go to the browser: instead of one JSON reply at the end, the server keeps the connection open and writes one line per event as the loop reports it.</p>
+
+<svg class="diagram" viewBox="0 0 820 200" role="img" aria-label="Server-sent events from the loop to the page">
+  <rect class="out" x="20" y="60" width="170" height="80"/><text x="105" y="90" text-anchor="middle" class="title">web/index.html</text><text x="105" y="110" text-anchor="middle" class="label">fetch('/chat') then</text><text x="105" y="126" text-anchor="middle" class="label">reads the body line by line</text>
+  <rect class="box" x="320" y="60" width="180" height="80"/><text x="410" y="90" text-anchor="middle" class="title">server.py</text><text x="410" y="110" text-anchor="middle" class="label">on_event = write one line</text><text x="410" y="126" text-anchor="middle" class="label">to the open connection</text>
+  <rect class="box" x="630" y="60" width="170" height="80"/><text x="715" y="90" text-anchor="middle" class="title">Agent.run(...)</text><text x="715" y="110" text-anchor="middle" class="label">the same loop</text>
+  <path class="arrow" d="M190,85 L320,85"/><text x="255" y="77" text-anchor="middle" class="label">POST {"text": "…"}</text>
+  <path class="arrow" d="M320,118 L190,118"/><text x="255" y="140" text-anchor="middle" class="mono">data: {"type": "tool_call", …}</text>
+  <path class="arrow" d="M500,85 L630,85"/><text x="565" y="77" text-anchor="middle" class="label">run(text, on_event)</text>
+  <path class="arrow" d="M630,118 L500,118"/><text x="565" y="140" text-anchor="middle" class="label">on_event(event)</text>
+  <text x="410" y="175" text-anchor="middle" class="label">That line format ("data: …" then a blank line) is called Server-Sent Events. That is all it is.</text>
+</svg>
+
+<p>The page has two tabs on the right. <b>Loop, step by step</b> draws one card per event: Reason, Act, Observe, Answer. <b>Messages the model sees</b> is the exact list from <code>GET /state</code>, so you can check with your own eyes that every tool message answers a tool call by id. When something goes wrong, that tab is the first place to look.</p>
+
+<details><summary>The server: agent/server.py</summary>{{code:agent/server.py}}</details>
+<details><summary>The offline demo: course/ch07_web_window.py</summary>{{code:course/ch07_web_window.py}}</details>
+<div class="cmd">python3 course/ch07_web_window.py      # opens the real page with a scripted model, no key needed
+python3 -m agent.server               # the same page with the real model from .env</div>
+<div class="note"><h4>Settings inside the page</h4>The Settings button lets you point the page at a different agent server, and paste a key, base URL and model that override <code>.env</code> for this conversation. Those values live in your browser and in the server's memory only; nothing is written to disk.</div>
+
+<!-- ===================================================== CH 8 ============== -->
+<h2 id="ch8">8 · Context: what the model sees first, and what to do when the list gets long</h2>
+<h3>The system prompt</h3>
+<p>Message 0 is sent on every call and holds the standing rules: look before you touch, edit precisely, run to check, summarise at the end. If the workspace contains an <code>AGENTS.md</code> file, its text is appended. That is how a project teaches the agent its own conventions without anyone changing Python. See <code>build_system_prompt</code> in <code>agent/__init__.py</code>.</p>
+
+<h3>Compaction</h3>
+<p>The list only grows, and every model has a window. Quality drops well before the hard limit. So before each model call the Agent estimates the size (about four characters per token, which is honest enough to decide <em>when</em>) and, past 80% of the window, shrinks the <em>old</em> part in two increasingly drastic steps.</p>
+
+<svg class="diagram" viewBox="0 0 820 210" role="img" aria-label="Compaction keeps a recent tail and summarises the rest">
+  <text x="20" y="26" class="title">Before</text>
+  <rect class="box" x="20" y="36" width="60" height="34"/><text x="50" y="58" text-anchor="middle" class="label">system</text>
+  <rect class="soft" x="86" y="36" width="60" height="34"/><text x="116" y="58" text-anchor="middle" class="label">user</text>
+  <rect class="tool" x="152" y="36" width="60" height="34"/><text x="182" y="58" text-anchor="middle" class="label">asst→tool</text>
+  <rect class="tool" x="218" y="36" width="60" height="34"/><text x="248" y="58" text-anchor="middle" class="label">tool</text>
+  <rect class="tool" x="284" y="36" width="60" height="34"/><text x="314" y="58" text-anchor="middle" class="label">asst→tool</text>
+  <rect class="tool" x="350" y="36" width="60" height="34"/><text x="380" y="58" text-anchor="middle" class="label">tool</text>
+  <text x="430" y="58" class="label">… many more …</text>
+  <rect class="tool" x="540" y="36" width="60" height="34"/><text x="570" y="58" text-anchor="middle" class="label">asst→tool</text>
+  <rect class="tool" x="606" y="36" width="60" height="34"/><text x="636" y="58" text-anchor="middle" class="label">tool</text>
+  <rect class="box" x="672" y="36" width="60" height="34"/><text x="702" y="58" text-anchor="middle" class="label">asst</text>
+  <text x="20" y="110" class="title">Step 1 · trim</text><text x="140" y="110" class="label">old tool results become "[old tool output removed to save space]". No model call. Nothing is removed, so no request is ever orphaned.</text>
+  <text x="20" y="150" class="title">Step 2 · summarise</text><text x="160" y="150" class="label">everything old becomes ONE user message ("Summary of the conversation so far: …"), written by the model.</text>
+  <text x="20" y="184" class="title">After</text>
+  <rect class="box" x="80" y="166" width="60" height="30"/><text x="110" y="186" text-anchor="middle" class="label">system</text>
+  <rect class="soft" x="146" y="166" width="90" height="30"/><text x="191" y="186" text-anchor="middle" class="label">summary</text>
+  <rect class="tool" x="242" y="166" width="60" height="30"/><text x="272" y="186" text-anchor="middle" class="label">asst→tool</text>
+  <rect class="tool" x="308" y="166" width="60" height="30"/><text x="338" y="186" text-anchor="middle" class="label">tool</text>
+  <rect class="box" x="374" y="166" width="60" height="30"/><text x="404" y="186" text-anchor="middle" class="label">asst</text>
+  <text x="450" y="186" class="label">← the recent tail is kept word for word</text>
+</svg>
+
+<p>One rule must never be broken: a tool message stays right after the assistant message that asked for it. So the cut is only ever placed at a user or assistant message, never at a tool message. <code>find_cut_index</code> in <code>agent/context.py</code> is where that rule lives, and it has its own test.</p>
+
+<details><summary>The code: agent/context.py</summary>{{code:agent/context.py}}</details>
+<details><summary>Watch it happen: course/ch08_context_window.py (offline)</summary>{{code:course/ch08_context_window.py}}</details>
+<div class="cmd">python3 course/ch08_context_window.py</div>
+<div class="breaks"><h4>What breaks if you remove it</h4>
+<ul>
+<li>No compaction → after enough steps, HTTP 400 "context length exceeded", and quietly worse answers long before that.</li>
+<li>Cutting at a tool message → HTTP 400: a tool result without its tool call.</li>
+<li>Estimating with the cumulative usage counter → you fire compaction far too early (the course this blueprint is based on shipped that bug and fixed it).</li>
+</ul></div>
+
+<!-- ===================================================== CH 9 ============== -->
+<h2 id="ch9">9 · The troubleshooting lab</h2>
+<p>This is the chapter for the day the agent inside your own app "does not give answers". Twelve failures, each reproduced with the fake model in <code>course/ch09_troubleshooting_lab.py</code>, so you can see the symptom on a machine that is not on fire. The table is the map; the file is the lab.</p>
+
+<div class="table-wrap"><table>
+<tr><th>#</th><th>Symptom you see</th><th>Cause</th><th>What the blueprint does / what to check</th></tr>
+<tr><td>1</td><td>A tool result says "there is no tool called X"</td><td>The model asked for a name that is not in the registry (schema and registry drifted, or the model invented one)</td><td>Registry miss becomes text; the model retries. Check both halves of the table use the same name.</td></tr>
+<tr><td>2</td><td>"arguments were not valid JSON"</td><td>The reply was cut off (<code>finish_reason == "length"</code>) or the model emitted broken JSON</td><td>Text error, model retries. If it repeats, raise <code>max_tokens</code> or shorten what you ask for.</td></tr>
+<tr><td>3</td><td>"wrong arguments for X: unexpected keyword"</td><td>Schema property names do not match the function's parameter names</td><td>Make them identical. The <code>TypeError</code> is caught and reported.</td></tr>
+<tr><td>4</td><td>"is outside the workspace and was refused"</td><td>The model used <code>..</code> or a symlink</td><td>Working as designed. If it keeps trying, put the absolute workspace path in the system prompt (it is there by default).</td></tr>
+<tr><td>5</td><td>edit_file: "not found" / "appears N times"</td><td>The model paraphrased instead of quoting, or the text is not unique</td><td>The error tells it to re-read and copy exactly. Line numbers in <code>read_file</code> exist for this.</td></tr>
+<tr><td>6</td><td>"Stopped after N steps without a final answer"</td><td>The model loops on the same tool</td><td>The brake. Read the Messages tab: what did it keep asking for? Usually a tool result it could not act on.</td></tr>
+<tr><td>7</td><td>Answers get vague; HTTP 400 context length</td><td>Huge tool outputs or a very long session</td><td><code>truncate_output</code> and compaction. Check <code>AGENT_CONTEXT_WINDOW</code> matches the model.</td></tr>
+<tr><td>8</td><td>The agent hangs on a command</td><td>The command waited for input</td><td>The timeout kills it and reports it. Tell the model to pass <code>timeout_seconds</code> or avoid interactive commands.</td></tr>
+<tr><td>9</td><td>The answer is "Error: HTTP 401 / 402 / 429 / 404 …"</td><td>Key, credits, rate limit, model id</td><td><code>explain_http_error</code> in <code>agent/llm.py</code> already says what to do. Check <code>.env</code>, then the provider dashboard.</td></tr>
+<tr><td>10</td><td>The model describes what it would do instead of doing it</td><td>Tools not sent, model without tool support, or a weak description</td><td>Confirm <code>tools</code> is in the payload; pick a model that lists <code>tools</code> in its supported parameters; write descriptions that say <em>when</em> to use the tool.</td></tr>
+<tr><td>11</td><td>HTTP 400 mentioning tool_call_id or message order</td><td>The list is malformed: a tool message with no request, or a user message before all requests were answered</td><td>Run <code>check_message_order(agent.messages)</code> from <code>agent/debug.py</code>. It names the bad index.</td></tr>
+<tr><td>12</td><td>HTTP 400 from a <em>different</em> provider after switching models</td><td>Provider-specific fields (reasoning, refusal) sent back in the history</td><td><code>clean_assistant_message</code> keeps only role, content and tool_calls.</td></tr>
+</table></div>
+
+<details><summary>The lab: course/ch09_troubleshooting_lab.py (offline)</summary>{{code:course/ch09_troubleshooting_lab.py}}</details>
+<details><summary>The helpers: agent/debug.py</summary>{{code:agent/debug.py}}</details>
+<div class="cmd">python3 course/ch09_troubleshooting_lab.py</div>
+
+<div class="note"><h4>The five questions to ask, in order, when it "gives no answer"</h4>
+<ol>
+<li>What did the <b>last event</b> say? (<code>error</code> events carry the HTTP hint; <code>answer</code> events carry an empty string if the model chose to say nothing.)</li>
+<li>Open <b>Messages the model sees</b>. Does every tool message answer a request just above it?</li>
+<li>What did the <b>last tool result</b> say? The model can only act on what that text told it.</li>
+<li>Is the <b>model</b> one that supports tools, and is the key allowed to use it?</li>
+<li>Replay the same steps with the <b>fake model</b>. If it works there, the loop is fine and the model is the variable.</li>
+</ol></div>
+
+<!-- ===================================================== CH 10 ============= -->
+<h2 id="ch10">10 · Your own tools: the blueprint in someone else's app</h2>
+<p>Nothing in <code>agent/loop.py</code> knows about files. It knows about a <code>ToolRegistry</code>. To reuse the agent in another application (a formulation assistant, a support bot, a data checker) you write new tools and keep everything else. The recipe is always the same four steps.</p>
+<ol>
+<li><b>Write plain functions.</b> Text or JSON-able values in, text out. Return error messages rather than raising, for anything the model could fix by trying again.</li>
+<li><b>Describe each one with a <code>Tool(...)</code>.</b> A name, a description written <em>for the model</em> (say when to use it), and JSON-schema parameters whose names match the function's parameters exactly.</li>
+<li><b>Put them in a <code>ToolRegistry</code></b> and hand it to <code>Agent(...)</code>.</li>
+<li><b>Write a system prompt</b> that says what the agent is for and what it must never guess.</li>
+</ol>
+
+<svg class="diagram" viewBox="0 0 820 150" role="img" aria-label="Swap the tools, keep the loop">
+  <rect class="box" x="300" y="40" width="220" height="70"/><text x="410" y="70" text-anchor="middle" class="title">Agent + loop + llm</text><text x="410" y="92" text-anchor="middle" class="label">unchanged</text>
+  <rect class="tool" x="20" y="20" width="220" height="50"/><text x="130" y="50" text-anchor="middle">list · read · write · edit · run</text>
+  <rect class="tool" x="20" y="85" width="220" height="50"/><text x="130" y="115" text-anchor="middle">lookup_ingredient · check_total</text>
+  <rect class="out" x="580" y="20" width="220" height="50"/><text x="690" y="50" text-anchor="middle">a coding agent</text>
+  <rect class="out" x="580" y="85" width="220" height="50"/><text x="690" y="115" text-anchor="middle">a formulation assistant</text>
+  <path class="arrow" d="M240,45 L300,65"/><path class="arrow" d="M240,110 L300,90"/>
+  <path class="arrow" d="M520,65 L580,45"/><path class="arrow" d="M520,90 L580,110"/>
+</svg>
+
+<details open><summary>The code: course/ch10_your_own_tools.py (offline)</summary>{{code:course/ch10_your_own_tools.py}}</details>
+<div class="cmd">python3 course/ch10_your_own_tools.py</div>
+
+<h3>Transplant checklist (for your own app)</h3>
+<ol>
+<li>Copy the <code>agent/</code> folder into your project. Keep <code>loop.py</code>, <code>tools.py</code>, <code>llm.py</code>, <code>config.py</code>, <code>context.py</code>, <code>fake_llm.py</code>, <code>debug.py</code>. Keep <code>workspace.py</code> only if your app needs file tools.</li>
+<li>Write your tools as in chapter 10. Give each one a test with the fake model: script one call, assert the function ran and the answer came back.</li>
+<li>Build the agent once per conversation: <code>Agent(llm=..., tools=ToolRegistry([...]), system_prompt=..., max_steps=..., context_window=...)</code>. One <code>Agent</code> object is one conversation; keep one per user session.</li>
+<li>Wire <code>on_event</code> to wherever your app shows progress. The event types are listed at the top of <code>agent/loop.py</code>.</li>
+<li>Before shipping, run chapter 9's five questions against a real failing conversation. Add <code>check_message_order</code> to your logging on any HTTP 400.</li>
+</ol>
+
+<!-- ===================================================== HOSTING =========== -->
+<h2 id="hosting">Run it, share it, host it</h2>
+<h3>Locally</h3>
+<div class="cmd">python3 -m agent.server        # http://127.0.0.1:8765</div>
+<h3>GitHub</h3>
+<p>The repository holds the package, the course chapters, the tests, this page's source (<code>docs/course.html</code>) and the deployment files. <code>.env</code> is git-ignored; the key never leaves your machine.</p>
+<h3>Cloudflare, two ways</h3>
+<div class="table-wrap"><table>
+<tr><th></th><th>Static site (free plan)</th><th>Sandboxed agent (Workers Paid, $5/month)</th></tr>
+<tr><td>What is hosted</td><td>This course and the chat page</td><td>This course, the chat page, and the same Python package running in a Linux container per browser session</td></tr>
+<tr><td>Where the agent runs</td><td>On your computer: <code>python3 -m agent.server</code>, then set the Agent server URL in the page's Settings to <code>http://127.0.0.1:8765</code> (Chrome or Firefox)</td><td>In the cloud. The Worker copies <code>agent/</code> into the sandbox and runs the exact command above</td></tr>
+<tr><td>Where the key lives</td><td>In your <code>.env</code>, or pasted into the page's Settings</td><td>Pasted into the page's Settings; sent to the sandbox with each message, held in memory only</td></tr>
+<tr><td>Deploy command</td><td><code>npm run deploy:site</code> in <code>deploy/cloudflare</code></td><td><code>npm run deploy:sandbox</code> in <code>deploy/cloudflare</code></td></tr>
+</table></div>
+<div class="warn"><h4>Two honest limits</h4>
+The cloud sandbox sleeps after 15 idle minutes and forgets its files and conversation; that is what makes it cheap. And a coding agent runs whatever commands the model chooses, so the hosted page is behind a password. On your own machine the workspace lock is a convenience, not a security boundary: the commands run as you.</div>
+
+<!-- ===================================================== GLOSSARY ========== -->
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap"><table>
+<tr><th>Term</th><th>Meaning here</th></tr>
+<tr><td>Message</td><td>A dictionary with a <code>role</code> (system, user, assistant, tool) and <code>content</code>. The unit the model reads.</td></tr>
+<tr><td>Tool call</td><td>A piece of JSON in an assistant message that asks for a function by name with arguments as a JSON <em>string</em>. It carries an <code>id</code>.</td></tr>
+<tr><td>Tool message</td><td>The result of running a tool, sent back with <code>tool_call_id</code> so the model knows which request it answers.</td></tr>
+<tr><td>Schema</td><td>The description of a tool the model reads: name, description, parameters (JSON Schema). The model never sees the Python.</td></tr>
+<tr><td>Registry</td><td>The dictionary from tool name to Tool. Looking a name up is not running it; <code>run()</code> is.</td></tr>
+<tr><td>The loop</td><td>Call the model; if it asked for tools, run them and append the results; repeat; stop when it answers with text.</td></tr>
+<tr><td>Step</td><td>One model call inside the loop. <code>max_steps</code> is the brake.</td></tr>
+<tr><td>Event</td><td>A small dictionary the loop hands to <code>on_event</code> whenever something happens. How every interface, terminal or web, watches the loop.</td></tr>
+<tr><td>Workspace</td><td>The only folder the tools may touch. Checked with <code>realpath</code> on every call.</td></tr>
+<tr><td>Context window</td><td>How much the model can read at once. Compaction keeps the list under 80% of it.</td></tr>
+<tr><td>Compaction</td><td>Shrinking the old part of the list: blank old tool results, then summarise. The recent tail stays verbatim.</td></tr>
+<tr><td>System prompt</td><td>Message 0: standing rules, plus the workspace's <code>AGENTS.md</code> if present.</td></tr>
+<tr><td>Fake model</td><td>A scripted stand-in for the model, used by tests and the offline chapters.</td></tr>
+<tr><td>SSE</td><td>Server-Sent Events: "data: …" lines written to an open HTTP connection. How the web page gets events as they happen.</td></tr>
+</table></div>
+
+<p class="lede" style="margin-top:40px">Built on the shoulders of the open-source course "Building a Coding Agent From Scratch" by Paul Iusztin (Decoding AI), Pi by Mario Zechner, and Thorsten Ball's "How to Build an Agent". This version strips every framework out so that each line answers to you.</p>
+
+</main>
+</div>
+
+<script>
+// ----- Chapter 3 step-through trace. Fixture values captured from a real run. -----
+(function () {
+  const code = [
+    'messages = [system_message, user_message]',
+    'message = ask_model(messages)',
+    'messages.append(message)',
+    'tool_calls = message.get("tool_calls") or []',
+    'for call in tool_calls:',
+    '    name = call["function"]["name"]',
+    '    arguments_json = call["function"]["arguments"]',
+    '    arguments = json.loads(arguments_json)',
+    '    result = read_file(**arguments)',
+    '    messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})',
+    'message = ask_model(messages)',
+    'messages.append(message)',
+    'print(message["content"])',
+  ];
+  const callId = 'call_oyJYDvOTO52fBf0smx5Wc0aW';
+  const steps = [
+    { line: 0, names: 'messages → list of 2 dicts', messages: '0 system: "You are an assistant with tools…"\n1 user:   "What is the launch code written in notes.txt?"', screen: '(nothing yet)', outside: 'none',
+      explain: 'We start with two messages in a Python list. The names on the right are the only state the program has.' },
+    { line: 1, names: 'message → {"role": "assistant",\n            "content": null,\n            "tool_calls": [ {"id": "' + callId + '",\n                             "function": {"name": "read_file",\n                                          "arguments": "{\\"path\\":\\"notes.txt\\"}"}} ]}\n(type: dict)', messages: '0 system\n1 user', screen: '(nothing yet)', outside: 'NETWORK: POST /chat/completions with 2 messages + 1 tool schema → reply received',
+      explain: 'ask_model() sends the list and the tool menu. The model does not answer the question; it asks us to run read_file. Note that content is null and arguments is a STRING of JSON, not a dict.' },
+    { line: 2, names: 'message → (same dict)\nreturn value of append → None', messages: '0 system\n1 user\n2 assistant → tool_calls: read_file [' + callId + ']', screen: '(nothing yet)', outside: 'none',
+      explain: 'The model\'s request is saved into the list exactly as it arrived. The API insists on this: the tool result we send later must answer a request that is in the list. append() returns None; the list is what changed.' },
+    { line: 3, names: 'tool_calls → list of 1 dict', messages: '0 system\n1 user\n2 assistant → tool_calls', screen: '(nothing yet)', outside: 'none',
+      explain: '.get("tool_calls") returns the list, or None when the model answered with text. "or []" turns None into an empty list so the for loop below is safe either way.' },
+    { line: 4, names: 'call → {"id": "' + callId + '", "function": {…}}', messages: '0 system\n1 user\n2 assistant → tool_calls', screen: '(nothing yet)', outside: 'none',
+      explain: 'The loop takes the requests one at a time. Here there is exactly one. Models often ask for several in one go; the loop shape is the same.' },
+    { line: 5, names: 'name → "read_file"  (str)', messages: '0 system\n1 user\n2 assistant → tool_calls', screen: '(nothing yet)', outside: 'none',
+      explain: 'Two dictionary lookups: call["function"] is a dict, and ["name"] inside it is the text "read_file". This is the name we will look up.' },
+    { line: 6, names: 'arguments_json → \'{"path":"notes.txt"}\'  (str)', messages: '0 system\n1 user\n2 assistant → tool_calls', screen: '(nothing yet)', outside: 'none',
+      explain: 'Still text. It looks like a dictionary, but Python sees a string of 21 characters. You cannot call a function with it yet.' },
+    { line: 7, names: 'arguments → {"path": "notes.txt"}  (dict)', messages: '0 system\n1 user\n2 assistant → tool_calls', screen: '(nothing yet)', outside: 'none',
+      explain: 'json.loads turns the text into a real dictionary. If the text were broken, this line would raise; the blueprint\'s registry catches that and sends the error back to the model as text.' },
+    { line: 8, names: 'result → "The launch code is PINEAPPLE-42.\\n"  (str)', messages: '0 system\n1 user\n2 assistant → tool_calls', screen: '(nothing yet)', outside: 'DISK: read workspace/notes.txt',
+      explain: 'read_file(**arguments) is read_file(path="notes.txt"). The two stars unpack the dictionary into keyword arguments. The function runs on your machine and returns text.' },
+    { line: 9, names: 'result → (same)', messages: '0 system\n1 user\n2 assistant → tool_calls\n3 tool (answers ' + callId.slice(0, 12) + '…): "The launch code is PINEAPPLE-42."', screen: '(nothing yet)', outside: 'none',
+      explain: 'The result goes back into the list as a tool message, linked to the request by tool_call_id. The model has not seen it yet; it will on the next call.' },
+    { line: 10, names: 'message → {"role": "assistant",\n            "content": "The launch code is **PINEAPPLE-42**."}\n(no tool_calls key)', messages: '0 system\n1 user\n2 assistant → tool_calls\n3 tool', screen: '(nothing yet)', outside: 'NETWORK: POST /chat/completions with 4 messages → reply received',
+      explain: 'Second call. Now the list contains the tool result, so the model can answer. This reply has text and no tool_calls: that absence is how the loop knows it is finished.' },
+    { line: 11, names: 'message → (same)', messages: '0 system\n1 user\n2 assistant → tool_calls\n3 tool\n4 assistant: "The launch code is **PINEAPPLE-42**."', screen: '(nothing yet)', outside: 'none',
+      explain: 'The answer is appended too, so a follow-up question would see the whole exchange.' },
+    { line: 12, names: 'return value of print → None', messages: '(5 messages)', screen: 'The launch code is **PINEAPPLE-42**.', outside: 'none',
+      explain: 'Only now does anything reach the screen. Everything before this line was the list changing and two HTTP calls.' },
+  ];
+  let index = 0;
+  const codePane = document.getElementById('t3-code');
+  function render() {
+    codePane.innerHTML = '';
+    code.forEach((text, i) => {
+      const div = document.createElement('div');
+      div.textContent = text;
+      if (i === steps[index].line) div.className = 'active';
+      else if (i < steps[index].line) div.className = 'done';
+      codePane.appendChild(div);
+    });
+    const step = steps[index];
+    document.getElementById('t3-names').textContent = step.names;
+    document.getElementById('t3-messages').textContent = step.messages;
+    document.getElementById('t3-screen').textContent = step.screen;
+    document.getElementById('t3-outside').textContent = step.outside;
+    document.getElementById('t3-explain').textContent = step.explain;
+    document.getElementById('t3-pos').textContent = 'step ' + (index + 1) + ' of ' + steps.length;
+    document.getElementById('t3-back').disabled = index === 0;
+    document.getElementById('t3-next').disabled = index === steps.length - 1;
+  }
+  document.getElementById('t3-next').addEventListener('click', () => { if (index < steps.length - 1) { index++; render(); } });
+  document.getElementById('t3-back').addEventListener('click', () => { if (index > 0) { index--; render(); } });
+  document.getElementById('t3-restart').addEventListener('click', () => { index = 0; render(); });
+  document.getElementById('trace-ch3').addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight') document.getElementById('t3-next').click();
+    if (e.key === 'ArrowLeft') document.getElementById('t3-back').click();
+  });
+  render();
+})();
+</script>
+</body>
+</html>
