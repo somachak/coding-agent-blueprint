@@ -69,15 +69,15 @@
   .trace .bar b { margin-right: auto; }
   .trace button { background: var(--panel); border: 1px solid var(--accent); color: var(--accent); border-radius: 6px; padding: 5px 12px; font-size: 13px; cursor: pointer; }
   .trace button:disabled { opacity: .4; cursor: default; }
-  .trace .grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 0; }
-  .trace .codepane { border-right: 1px solid var(--line); padding: 12px 14px; font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); }
-  .trace .codepane div { padding: 1px 6px; white-space: pre; border-radius: 4px; color: var(--code-ink); }
+  .trace .grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 0; }
+  .trace .codepane { border-right: 1px solid var(--line); padding: 12px 14px; font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); min-width: 0; }
+  .trace .codepane div { padding: 1px 6px; white-space: pre-wrap; word-break: break-word; border-radius: 4px; color: var(--code-ink); }
   .trace .codepane div.active { background: #fde68a; outline: 2px solid #d6a13b; }
   .trace .codepane div.done { color: #7c8794; }
   .trace .panels { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; font-size: 13px; }
   .trace .panel { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
   .trace .panel h5 { margin: 0 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
-  .trace .panel pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; margin: 0; color: var(--code-ink); }
+  .trace .panel pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word; margin: 0; color: var(--code-ink); }
   .trace .explain { padding: 12px 14px; border-top: 1px solid var(--line); background: #fffdf5; font-size: 14px; }
   @media (max-width: 900px) {
     .layout { grid-template-columns: 1fr; }

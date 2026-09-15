@@ -36,8 +36,13 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    const denied = requireAuth(request, env);
-    if (denied) return denied;
+    // The course page is public. The chat page and the agent routes are
+    // private, because a sandbox costs money and runs whatever the model asks.
+    const isPrivate = AGENT_ROUTES.has(url.pathname) || url.pathname.startsWith("/app");
+    if (isPrivate) {
+      const denied = requireAuth(request, env);
+      if (denied) return denied;
+    }
 
     if (!AGENT_ROUTES.has(url.pathname)) {
       return env.ASSETS.fetch(request);
